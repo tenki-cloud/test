@@ -17,41 +17,41 @@ jobs:
           sleep 20
           echo 1111111111
 
-  # build-2:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 22222222222
+  build-2:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 22222222222
 
-  # build-3:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 33333333333
+  build-3:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 33333333333
 
-  # build-4:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 4444444444
+  build-4:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 4444444444
 
-  # build-5:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 5555555
+  build-5:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 5555555
 
   # build-6:
   #   runs-on: tenki-standard-autoscale

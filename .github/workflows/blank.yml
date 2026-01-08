@@ -24,7 +24,7 @@ jobs:
       - name: Sleep and Print
         run: |
           sleep 20
-          echo 22222222222
+          echo 222222222222
 
   build-3:
     runs-on: tenki-standard-autoscale

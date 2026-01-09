@@ -53,96 +53,96 @@ jobs:
           sleep 20
           echo 5555555
 
-  # build-6:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 66666
+  build-6:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 66666
 
-  # build-7:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 77777
+  build-7:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 77777
 
-  # build-8:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 88888
+  build-8:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 88888
           
-  # build-9:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 9999
+  build-9:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 9999
           
-  # build-10:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo '10 10 10 10'
+  build-10:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo '10 10 10 10'
           
-  # build-11:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo '11 11 11 11'
-  # build-12:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo '12 12 12 12'
-  # build-13:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo '13 13 13 13'
-  # build-14:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo '14 14 14 14'
-  # build-15:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo '15 15 15 15'
-  # build-16:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo '16 16 16 16 16'
+  build-11:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo '11 11 11 11'
+  build-12:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo '12 12 12 12'
+  build-13:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo '13 13 13 13'
+  build-14:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo '14 14 14 14'
+  build-15:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo '15 15 15 15'
+  build-16:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo '16 16 16 16 16'

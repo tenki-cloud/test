@@ -1,0 +1,50 @@
+name: Network Benchmark
+on: workflow_dispatch
+
+jobs:
+  bench:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, tenki-standard-small-2c-4g]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Latency to Cloudflare
+        run: |
+          # Ping Cloudflare edge
+          ping -c 20 1.1.1.1 | tail -1
+          # Latency to R2 endpoint (replace with actual bucket endpoint)
+          curl -o /dev/null -s -w "DNS: %{time_namelookup}s\nConnect: %{time_connect}s\nTTFB: %{time_starttransfer}s\nTotal: %{time_total}s\n" \
+            https://<account-id>.r2.cloudflarestorage.com/
+
+      - name: Bandwidth (upload)
+        run: |
+          # Generate test files
+          dd if=/dev/urandom of=/tmp/100mb.bin bs=1M count=100 2>/dev/null
+          dd if=/dev/urandom of=/tmp/500mb.bin bs=1M count=500 2>/dev/null
+
+          # Upload speed to a known endpoint (speed.cloudflare.com)
+          curl -o /dev/null -s -w "%{speed_upload}" --data-binary @/tmp/100mb.bin https://speed.cloudflare.com/__up
+          echo " bytes/sec (100MB)"
+
+          curl -o /dev/null -s -w "%{speed_upload}" --data-binary @/tmp/500mb.bin https://speed.cloudflare.com/__up
+          echo " bytes/sec (500MB)"
+
+      - name: Bandwidth (download)
+        run: |
+          curl -o /dev/null -s -w "Speed: %{speed_download} bytes/sec\nTotal: %{time_total}s\n" \
+            https://speed.cloudflare.com/__down?bytes=500000000
+
+      - name: Connection stability (sustained transfer)
+        run: |
+          # 10 sequential uploads of 100MB - check for timeouts/variance
+          for i in $(seq 1 10); do
+            TIME=$(curl -o /dev/null -s -w "%{time_total}" --max-time 120 --data-binary @/tmp/100mb.bin https://speed.cloudflare.com/__up)
+            echo "Run $i: ${TIME}s"
+          done
+
+      - name: MTU / packet loss
+        run: |
+          # Check for packet loss over 100 packets
+          ping -c 100 -q 1.1.1.1
+          # Traceroute to see path differences
+          traceroute -m 20 1.1.1.1 || true

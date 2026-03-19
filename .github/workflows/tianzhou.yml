@@ -36,36 +36,79 @@ jobs:
           done
 
       - name: MTU / packet loss
+        continue-on-error: true
         run: |
           ping -c 100 -q 1.1.1.1
           traceroute -m 20 1.1.1.1 || true
 
       - name: System resources
-        run: free -h && df -h /tmp
+        run: free -h && df -h /tmp && nproc
 
-      - name: Upload to actual R2
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
-          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      - name: Generate test files
         run: |
-          dd if=/dev/urandom of=/tmp/500mb.bin bs=1M count=500 2>/dev/null
-          # Time a real S3 PUT to R2
+          dd if=/dev/urandom of=/tmp/500mb-1.bin bs=1M count=500 2>/dev/null
+          dd if=/dev/urandom of=/tmp/500mb-2.bin bs=1M count=500 2>/dev/null
+          dd if=/dev/urandom of=/tmp/500mb-3.bin bs=1M count=500 2>/dev/null
+          ls -lh /tmp/500mb-*.bin
+
+      - name: Sequential R2 upload (baseline)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          echo "=== Sequential: 3x 500MB uploads ==="
           for i in 1 2 3; do
-            time aws s3 cp /tmp/500mb.bin "s3://test-bucket/bench-${RUNNER_NAME}-${i}.bin" \
+            echo "--- Upload $i ---"
+            free -m | grep Mem
+            time aws s3 cp "/tmp/500mb-${i}.bin" "s3://${R2_BUCKET}/bench-seq-${RUNNER_NAME:-unknown}-${i}.bin" \
               --endpoint-url "$R2_ENDPOINT" 2>&1
           done
 
-      - name: Memory during concurrent uploads
+      - name: Concurrent R2 upload (3 parallel - matches customer workload)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          # Simulate concurrency 3 with 500MB files
-          for i in 1 2 3; do cp /tmp/500mb.bin "/tmp/500mb-${i}.bin"; done
-          aws s3 cp /tmp/500mb-1.bin "s3://test-bucket/c1.bin" --endpoint-url "$R2_ENDPOINT" &
-          aws s3 cp /tmp/500mb-2.bin "s3://test-bucket/c2.bin" --endpoint-url "$R2_ENDPOINT" &
-          aws s3 cp /tmp/500mb-3.bin "s3://test-bucket/c3.bin" --endpoint-url "$R2_ENDPOINT" &
-          while jobs %1 2>/dev/null || jobs %2 2>/dev/null || jobs %3 2>/dev/null; do
-            free -m | grep Mem; sleep 5
+          echo "=== Concurrent: 3x 500MB uploads in parallel ==="
+          free -m | grep Mem
+          echo "--- Starting 3 parallel uploads ---"
+          START=$(date +%s)
+
+          aws s3 cp /tmp/500mb-1.bin "s3://${R2_BUCKET}/bench-par-${RUNNER_NAME:-unknown}-1.bin" \
+            --endpoint-url "$R2_ENDPOINT" 2>&1 &
+          PID1=$!
+          aws s3 cp /tmp/500mb-2.bin "s3://${R2_BUCKET}/bench-par-${RUNNER_NAME:-unknown}-2.bin" \
+            --endpoint-url "$R2_ENDPOINT" 2>&1 &
+          PID2=$!
+          aws s3 cp /tmp/500mb-3.bin "s3://${R2_BUCKET}/bench-par-${RUNNER_NAME:-unknown}-3.bin" \
+            --endpoint-url "$R2_ENDPOINT" 2>&1 &
+          PID3=$!
+
+          # Monitor memory while uploads run
+          while kill -0 $PID1 2>/dev/null || kill -0 $PID2 2>/dev/null || kill -0 $PID3 2>/dev/null; do
+            echo "$(date +%T) $(free -m | grep Mem)"
+            sleep 5
           done
+
+          wait $PID1; echo "Upload 1 exit: $?"
+          wait $PID2; echo "Upload 2 exit: $?"
+          wait $PID3; echo "Upload 3 exit: $?"
+
+          END=$(date +%s)
+          echo "Total wall time: $((END - START))s"
+          free -m | grep Mem
+
+      - name: Cleanup R2 test files
+        if: always()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          aws s3 rm "s3://${R2_BUCKET}/" --recursive --endpoint-url "$R2_ENDPOINT" || true
           wait

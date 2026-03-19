@@ -7,6 +7,7 @@ jobs:
       matrix:
         runner: [ubuntu-latest, tenki-standard-small-2c-4g]
     runs-on: ${{ matrix.runner }}
+    environment: test
     steps:
       - name: Latency to Cloudflare
         run: |

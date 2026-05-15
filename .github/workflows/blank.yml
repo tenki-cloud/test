@@ -17,14 +17,14 @@ jobs:
           sleep 20
           echo 1111
 
-  # build-2:
-  #   runs-on: tenki-standard-autoscale
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Sleep and Print
-  #       run: |
-  #         sleep 20
-  #         echo 222222222222
+  build-2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 222222222222
 
   # build-3:
   #   runs-on: tenki-standard-autoscale

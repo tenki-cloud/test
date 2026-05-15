@@ -8,14 +8,14 @@ on:
   delete:
 
 jobs:
-  build-1:
-    runs-on: tenki-standard-small-2c-4g
-    steps:
-      - uses: actions/checkout@v4
-      - name: Sleep and Print
-        run: |
-          sleep 20
-          echo 1111
+  # build-1:
+  #   runs-on: tenki-standard-small-2c-4g
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Sleep and Print
+  #       run: |
+  #         sleep 20
+  #         echo 1111
 
   build-2:
     runs-on: ubuntu-latest

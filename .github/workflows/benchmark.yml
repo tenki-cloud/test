@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-1:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - name: Sleep and Print
@@ -18,7 +18,7 @@ jobs:
           echo 1111
 
   build-2:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - name: Sleep and Print

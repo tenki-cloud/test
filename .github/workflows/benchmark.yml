@@ -1,0 +1,27 @@
+name: Go
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  create:
+  delete:
+
+jobs:
+  build-1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 1111
+
+  build-2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sleep and Print
+        run: |
+          sleep 20
+          echo 222222222222

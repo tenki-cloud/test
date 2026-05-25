@@ -1,27 +1,140 @@
-name: Go
+name: Hardware Benchmark — tenki vs GitHub vs Blacksmith
+
+# Measures raw hardware perf (CPU single/multi, memory bandwidth, disk
+# IOPS, network) on three runner backends so we can compare them
+# without depending on any specific repo's test suite.
+#
+# Runner specs (nominal):
+#   - ubuntu-latest                     : 4 vCPU / 16 GB  (GitHub free tier)
+#   - tenki-standard-large-plus-16c-32g : 16 vCPU / 32 GB
+#   - blacksmith-16vcpu-ubuntu-2404     : 16 vCPU / ~64 GB
+#
+# ubuntu-latest only has 4 vCPU so multi-thread numbers should be
+# normalized per-vCPU when comparing against the 16 vCPU runners.
 
 on:
+  workflow_dispatch: {}
   push:
-  pull_request:
-  workflow_dispatch:
-  create:
-  delete:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-1:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Sleep and Print
-        run: |
-          sleep 20
-          echo 1111
+  benchmark:
+    name: Bench on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - tenki-standard-large-plus-16c-32g
+          - blacksmith-16vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
 
-  build-2:
-    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Sleep and Print
+      - name: Install benchmark tools
         run: |
-          sleep 20
-          echo 222222222222
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            sysbench fio iputils-ping iproute2 curl
+
+      - name: System info
+        shell: bash
+        run: |
+          set +e
+          echo "============================================================"
+          echo "RUNNER: ${{ matrix.runner }}"
+          echo "============================================================"
+          echo
+          echo "--- uname ---"
+          uname -a
+          echo
+          echo "--- nproc / RAM ---"
+          echo "nproc=$(nproc)"
+          free -h | head -2
+          echo
+          echo "--- CPU (lscpu) ---"
+          lscpu | grep -E '^Architecture|^CPU\(s\)|^Thread|^Core|^Socket|^Vendor|^Model name|^CPU MHz|^CPU max|^L1|^L2|^L3'
+          echo
+          echo "--- CPU (/proc/cpuinfo first core) ---"
+          grep -m1 'model name'  /proc/cpuinfo
+          grep -m1 'cpu MHz'     /proc/cpuinfo
+          grep -m1 'cache size'  /proc/cpuinfo
+          echo
+          echo "--- Disk (root fs) ---"
+          df -hT / | head -3
+          mount | grep ' / ' | head -2
+          echo
+          echo "--- Virtualisation ---"
+          systemd-detect-virt 2>/dev/null || true
+          echo "sys_vendor: $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)"
+          echo "product:    $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
+
+      - name: CPU — single thread (10s)
+        run: |
+          sysbench cpu --threads=1 --time=10 --cpu-max-prime=20000 run \
+            | grep -E 'events per second|total time:|total number of events:'
+
+      - name: CPU — all threads (10s)
+        run: |
+          sysbench cpu --threads=$(nproc) --time=10 --cpu-max-prime=20000 run \
+            | grep -E 'events per second|total time:|total number of events:'
+
+      - name: Memory bandwidth — all threads, 10 GiB total, 1 MiB blocks
+        run: |
+          sysbench memory --threads=$(nproc) --memory-block-size=1M \
+            --memory-total-size=10G --memory-oper=write run \
+            | grep -E 'transferred|MiB/sec|operations|total time:'
+
+      - name: Disk — randwrite 4k qd32 (15s, cached)
+        shell: bash
+        run: |
+          mkdir -p ./.fio
+          fio --name=rw --rw=randwrite --bs=4k --iodepth=32 \
+              --size=1G --runtime=15 --time_based \
+              --filename=./.fio/rw.test --direct=0 --group_reporting \
+              | grep -E 'IOPS=|bw \(|^\s+lat \(.*\): *min' | head -6
+
+      - name: Disk — randread 4k qd32 (15s, cached)
+        shell: bash
+        run: |
+          fio --name=rr --rw=randread --bs=4k --iodepth=32 \
+              --size=1G --runtime=15 --time_based \
+              --filename=./.fio/rr.test --direct=0 --group_reporting \
+              | grep -E 'IOPS=|bw \(|^\s+lat \(.*\): *min' | head -6
+
+      - name: Disk — sequential read 1m qd8 (15s)
+        shell: bash
+        run: |
+          fio --name=sr --rw=read --bs=1m --iodepth=8 \
+              --size=2G --runtime=15 --time_based \
+              --filename=./.fio/sr.test --direct=0 --group_reporting \
+              | grep -E 'IOPS=|bw \(' | head -4
+          rm -rf ./.fio
+
+      - name: Network — DNS + outbound HTTPS to github.com
+        shell: bash
+        run: |
+          set +e
+          echo "--- 5 DNS lookups ---"
+          for i in 1 2 3 4 5; do
+            t0=$(date +%s%N)
+            getent hosts github.com >/dev/null
+            t1=$(date +%s%N)
+            echo "lookup $i: $(( (t1-t0)/1000000 )) ms"
+          done
+          echo
+          echo "--- 3 curl HTTPS fetches to https://github.com ---"
+          for i in 1 2 3; do
+            curl -sS -o /dev/null \
+              -w "fetch $i: dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
+              https://github.com
+          done
+          echo
+          echo "--- ping github.com x5 ---"
+          ping -c 5 -i 0.2 -W 1 github.com 2>&1 | tail -6

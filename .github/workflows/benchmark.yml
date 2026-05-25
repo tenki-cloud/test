@@ -136,5 +136,6 @@ jobs:
               https://github.com
           done
           echo
-          echo "--- ping github.com x5 ---"
-          ping -c 5 -i 0.2 -W 1 github.com 2>&1 | tail -6
+          echo "--- ping github.com x5 (may fail if ICMP blocked / no CAP_NET_RAW) ---"
+          ping -c 5 -i 0.2 -W 1 github.com 2>&1 | tail -6 || true
+          exit 0

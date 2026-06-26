@@ -1,0 +1,135 @@
+name: IOReport Probe (macOS)
+
+# Empirically tests whether Apple SoC power/energy telemetry is exposed inside a
+# Tenki macOS runner. mactop / asitop / macmon read CPU/GPU/ANE power and DRAM
+# bandwidth through the private IOReport API ("Energy Model" channel group); the
+# mlxfast benchmark depends on mactop's hardware DRAM counter.
+#
+# Tenki macOS runners are Apple Virtualization.framework guests. Hypothesis: the
+# SoC PMGR / memory-controller IOKit nodes are NOT passed through to the guest,
+# so IOReport finds zero "Energy Model" channels and mactop reads nothing —
+# meaning the benchmark must run on bare metal, not in a runner VM.
+#
+# Modeled on the simple "Go" (blank.yml) workflow: one job, manual trigger.
+#
+# Run it:  Actions tab -> "IOReport Probe (macOS)" -> Run workflow
+#     or:  gh workflow run ioreport-probe.yml -f runner=tenki-macos-latest-medium
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner label to probe
+        default: tenki-macos-latest-medium
+        type: string
+
+jobs:
+  ioreport:
+    name: Probe IOReport
+    runs-on: ${{ inputs.runner || 'tenki-macos-latest-medium' }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Host / virtualization info
+        shell: bash
+        run: |
+          set +e
+          echo "=== uname ==="
+          uname -a
+          echo
+          echo "=== hardware ==="
+          echo "hw.model              : $(sysctl -n hw.model 2>/dev/null)"
+          echo "machdep.cpu.brand     : $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+          echo "hw.ncpu / hw.memsize  : $(sysctl -n hw.ncpu 2>/dev/null) / $(sysctl -n hw.memsize 2>/dev/null)"
+          echo
+          echo "=== system_profiler (hardware, brief) ==="
+          system_profiler SPHardwareDataType 2>/dev/null | sed -n '1,20p'
+          exit 0
+
+      - name: ioreg scan for energy / PMGR nodes
+        shell: bash
+        run: |
+          set +e
+          echo "IORegistry nodes that usually carry power telemetry."
+          echo "Present on bare metal; typically absent in a VM."
+          echo
+          echo "energy matches      : $(ioreg -l 2>/dev/null | grep -ci energy)"
+          echo "pmgr matches        : $(ioreg -rc AppleARMIODevice 2>/dev/null | grep -ci pmgr)"
+          echo "IOReportLegend keys : $(ioreg -l 2>/dev/null | grep -ci IOReportLegend)"
+          exit 0
+
+      - name: powermetrics cross-check (needs sudo)
+        shell: bash
+        run: |
+          set +e
+          if sudo -n true 2>/dev/null; then
+            echo "Running: sudo powermetrics -n 1 -i 200 --samplers cpu_power,gpu_power"
+            echo "(In a VM this errors or returns no power data.)"
+            echo
+            sudo powermetrics -n 1 -i 200 --samplers cpu_power,gpu_power 2>&1 | sed -n '1,40p'
+          else
+            echo "No passwordless sudo here; skipping powermetrics."
+            echo "The IOReport probe below is the decisive test and needs no sudo."
+          fi
+          exit 0
+
+      - name: Build & run IOReport probe (decisive)
+        shell: bash
+        run: |
+          set +e
+          echo "=== compiling ioreport_probe.c ==="
+          clang -O2 -fblocks ioreport_probe.c -framework CoreFoundation -o ./ioreport_probe
+          if [ $? -ne 0 ]; then
+            echo "FAIL: probe did not compile"
+            echo "## IOReport probe: ❌ COMPILE FAILED on \`${{ inputs.runner || 'tenki-macos-latest-medium' }}\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo
+          echo "=== running ioreport_probe ==="
+          ./ioreport_probe
+          rc=$?
+          echo
+          echo "probe exit code: $rc"
+          {
+            echo "## IOReport probe on \`${{ inputs.runner || 'tenki-macos-latest-medium' }}\`"
+            if [ "$rc" -eq 0 ]; then
+              echo "✅ **Energy Model channels present** — SoC power/energy telemetry is AVAILABLE."
+              echo ""
+              echo "mactop / asitop / macmon (and DRAM-bandwidth reads) would work here."
+            elif [ "$rc" -eq 1 ]; then
+              echo "❌ **No Energy Model channels** — SoC power/energy telemetry is UNAVAILABLE."
+              echo ""
+              echo "mactop power + DRAM-bandwidth reads are empty here. Consistent with an"
+              echo "Apple Virtualization.framework guest — the mlxfast benchmark must run on"
+              echo "bare metal, not in a runner VM."
+            else
+              echo "⚠️ **Could not load IOReport** (rc=$rc)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Stay green: "telemetry absent" is the expected finding in a VM, not a
+          # runner failure. Flip to `exit $rc` if you want the job to gate on it.
+          exit 0
+
+      - name: mactop cross-check (best-effort)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          # mactop is the exact tool the mlxfast benchmark relies on. It is a TUI,
+          # so without a TTY we just run it briefly and capture whatever it prints.
+          echo "--- installing mactop (best-effort) ---"
+          brew install mactop 2>&1 | tail -3 \
+            || brew install context-labs/mactop/mactop 2>&1 | tail -3 \
+            || { command -v go >/dev/null 2>&1 && GOBIN="$PWD" go install github.com/context-labs/mactop@latest 2>&1 | tail -3; }
+
+          MACTOP="$(command -v mactop || echo ./mactop)"
+          if [ -x "$MACTOP" ]; then
+            echo
+            echo "--- $MACTOP (3s capture) ---"
+            sudo -n timeout 3 "$MACTOP" 2>&1 | head -40 || timeout 3 "$MACTOP" 2>&1 | head -40 || true
+          else
+            echo "mactop not installed; the IOReport probe above is decisive."
+          fi
+          exit 0

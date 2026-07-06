@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-1:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-autoscale
     steps:
       - uses: actions/checkout@v4
       - name: Sleep and Print

@@ -1,0 +1,160 @@
+name: macOS Thermal Stress (M-series)
+
+# Sustained CPU stress on Tenki macOS runners to reproduce thermal throttling.
+# Runs 2 jobs in PARALLEL (matrix), ~10 min each.
+#
+# TELEMETRY NOTE — Tenki macOS runners are Apple Virtualization.framework guests.
+# Per ioreport-probe.yml, SoC power/thermal (IOReport "Energy Model"), powermetrics
+# power/thermal, and die-temp/fan are NOT exposed inside the guest. So the reliable
+# IN-GUEST throttle signal is THROUGHPUT DEGRADATION: we run a fixed CPU benchmark in
+# back-to-back rounds and log bogo-ops/s per round. A cool chip boosts high; as it
+# heats and throttles, bogo-ops/s drops. first-vs-last delta = throttle magnitude.
+#
+# Authoritative die-temp / thermal-pressure must be captured on the HOST, in parallel:
+#   ssh <mac-host> 'sudo powermetrics --samplers thermal -i 1000'
+# (host = the lbm-* box the job lands on; find it via the job's runner name.)
+#
+# Run:  gh workflow run macos-thermal-stress.yml -f duration_min=10
+#   or: Actions tab -> this workflow -> Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner label
+        default: tenki-macos-latest-medium
+        type: string
+      duration_min:
+        description: Stress duration per job (minutes)
+        default: "10"
+        type: string
+      round_secs:
+        description: Seconds per benchmark round
+        default: "20"
+        type: string
+
+jobs:
+  stress:
+    name: stress-${{ matrix.instance }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        instance: [a, b]
+    runs-on: ${{ inputs.runner || 'tenki-macos-latest-medium' }}
+    timeout-minutes: 20
+    steps:
+      - name: Host / SoC info
+        shell: bash
+        run: |
+          set +e
+          echo "instance   : ${{ matrix.instance }}"
+          echo "runner_name: ${RUNNER_NAME:-unknown}   <- match this to a lbm-* host for SSH thermal capture"
+          echo "hostname   : $(hostname)"
+          echo "hw.model   : $(sysctl -n hw.model 2>/dev/null)"
+          echo "cpu        : $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+          echo "ncpu       : $(sysctl -n hw.ncpu 2>/dev/null) (P:$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null) E:$(sysctl -n hw.perflevel1.logicalcpu 2>/dev/null))"
+          echo "memsize    : $(sysctl -n hw.memsize 2>/dev/null)"
+          uname -a
+          exit 0
+
+      - name: Install stress-ng
+        shell: bash
+        run: |
+          set +e
+          command -v stress-ng >/dev/null 2>&1 || brew install stress-ng 2>&1 | tail -3
+          stress-ng --version 2>&1 || echo "stress-ng unavailable; will use fallback load"
+          exit 0
+
+      - name: Stress + throughput throttle probe
+        shell: bash
+        env:
+          DURATION_MIN: ${{ inputs.duration_min || '10' }}
+          ROUND_SECS: ${{ inputs.round_secs || '20' }}
+        run: |
+          set +e
+          LOG="probe-${{ matrix.instance }}.csv"
+          echo "ts_epoch,elapsed_s,round,bogo_ops_per_s,pressure,cpu_speed_limit" > "$LOG"
+
+          total=$(( DURATION_MIN * 60 ))
+          rounds=$(( total / ROUND_SECS ))
+          [ "$rounds" -lt 1 ] && rounds=1
+          ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+          have_sng=0; command -v stress-ng >/dev/null 2>&1 && have_sng=1
+          start=$(date +%s)
+          echo "Running $rounds rounds x ${ROUND_SECS}s (~${total}s) on all $ncpu cores; stress-ng=$have_sng"
+
+          for r in $(seq 1 "$rounds"); do
+            ops="NA"
+            if [ "$have_sng" -eq 1 ]; then
+              rm -f round.yaml
+              # Fixed method (matrixprod) so bogo-ops/s is comparable across rounds.
+              stress-ng --cpu 0 --cpu-method matrixprod --metrics --yaml round.yaml \
+                        --timeout "${ROUND_SECS}s" >/dev/null 2>&1
+              ops=$(grep 'bogo-ops-per-second-real-time' round.yaml 2>/dev/null | head -1 | awk '{print $2}')
+              [ -z "$ops" ] && ops="NA"
+            else
+              # Fallback: saturate all cores for the round (no throughput metric).
+              for c in $(seq 1 "$ncpu"); do
+                ( e=$((SECONDS+ROUND_SECS)); while [ "$SECONDS" -lt "$e" ]; do
+                    python3 -c "import math;[math.sqrt(i) for i in range(300000)]"; done ) &
+              done
+              wait
+              ops="NA_no_stressng"
+            fi
+
+            # Best-effort host thermal (usually empty inside a VM guest).
+            pressure="NA"
+            sudo -n true 2>/dev/null && pressure=$(sudo -n powermetrics -n 1 -i 200 --samplers thermal 2>/dev/null \
+              | awk -F': ' '/pressure level/{print $2; exit}')
+            [ -z "$pressure" ] && pressure="NA"
+            speed=$(pmset -g therm 2>/dev/null | awk -F'= ' '/CPU_Speed_Limit/{print $2; exit}')
+            [ -z "$speed" ] && speed="NA"
+
+            now=$(date +%s)
+            echo "$now,$((now-start)),$r,$ops,$pressure,$speed" | tee -a "$LOG"
+          done
+          exit 0
+
+      - name: Summary (throttle delta)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          LOG="probe-${{ matrix.instance }}.csv"
+          [ -f "$LOG" ] || { echo "no log"; exit 0; }
+          {
+            echo "### macOS stress — instance \`${{ matrix.instance }}\` on \`$(sysctl -n hw.model 2>/dev/null)\`"
+            echo "runner: \`${RUNNER_NAME:-unknown}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          awk -F, 'NR>1 && $4 ~ /^[0-9.]+$/ {print $4}' "$LOG" > ops.txt
+          n=$(wc -l < ops.txt | tr -d ' ')
+          if [ "$n" -ge 6 ]; then
+            first=$(head -3 ops.txt | awk '{s+=$1}END{printf "%.1f",s/NR}')
+            last=$(tail -3 ops.txt | awk '{s+=$1}END{printf "%.1f",s/NR}')
+            drop=$(awk -v a="$first" -v b="$last" 'BEGIN{if(a>0)printf "%.1f",(a-b)/a*100; else print "NA"}')
+            {
+              echo "- rounds with data: $n"
+              echo "- start bogo-ops/s (avg first 3): **$first**"
+              echo "- end   bogo-ops/s (avg last 3):  **$last**"
+              echo "- **throughput drop: ${drop}%** (higher = more thermal throttling)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- not enough numeric data points ($n) — check stress-ng install" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo ""
+            echo '```'
+            cat "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Upload probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.instance }}
+          path: probe-${{ matrix.instance }}.csv
+          if-no-files-found: warn

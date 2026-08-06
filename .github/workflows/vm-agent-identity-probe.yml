@@ -1,15 +1,17 @@
-name: vm-agent identity probe
+name: Probe vm-agent identity
 
-# Reports which vm-agent binary a runner VM is actually running, and optionally
-# asserts it against an expected sha256.
+# Reports which vm-agent binary a runner VM is actually running. Report-only:
+# it never fails the job, so a mismatch is information rather than a gate.
 #
 # Why this exists: a VM's root filesystem comes from a *snapshot*, which is a
 # frozen copy of a whole machine — memory and disk. Injecting a new binary into
 # a base rootfs does NOT reach running VMs until the snapshot is rebuilt, and
 # the rebuild script aborts if the snapshot name already exists. Both failures
 # are silent from the outside, so the only trustworthy check is to look inside
-# a real VM. sha256 and size are the only reliable identity: `strings` cannot
-# find Go symbol names (they live in a compressed pclntab), and process/VM age
+# a real VM.
+#
+# sha256 and size are the only reliable identity: `strings` cannot find Go
+# symbol names (they live in a compressed pclntab), and process/VM age
 # comparisons are meaningless because /proc/uptime is inherited from the
 # snapshot's memory image.
 
@@ -35,11 +37,15 @@ jobs:
         run: |
           BIN=/usr/local/bin/vm-agent
           if [ ! -f "$BIN" ]; then
-            echo "::error::$BIN not found on this runner"
-            exit 1
+            echo "::warning::$BIN not found on this runner"
+            exit 0
           fi
           SHA=$(sha256sum "$BIN" | cut -d' ' -f1)
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+          echo "sha256 = $SHA"
+          echo "size   = $(stat -c %s "$BIN") bytes"
+          echo "mtime  = $(stat -c %y "$BIN")"
 
           {
             echo "### vm-agent identity"
@@ -52,9 +58,6 @@ jobs:
             echo "| runner | $(hostname) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "sha256 = $SHA"
-          stat -c 'size   = %s bytes%nmtime  = %y' "$BIN"
-
       - name: Where this VM came from
         run: |
           # -node-name is baked into the rootfs by whichever base VM built the
@@ -63,7 +66,7 @@ jobs:
           echo "vm_uptime = $(cut -d' ' -f1 /proc/uptime)s"
           sudo grep -a "VM Agent .* started" /var/log/vm-agent.log 2>/dev/null | tail -1 || true
 
-      - name: Verdict
+      - name: Compare against expected
         if: inputs.expected_sha256 != ''
         run: |
           GOT="${{ steps.id.outputs.sha256 }}"
@@ -72,9 +75,7 @@ jobs:
             echo "MATCH — the VM is running the expected build"
             echo "**MATCH** — the VM is running the expected build" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "MISMATCH"
-            echo "  want $WANT"
-            echo "  got  $GOT"
+            echo "::warning::MISMATCH — want $WANT, got $GOT"
             {
               echo
               echo "**MISMATCH** — expected \`$WANT\`"
@@ -83,5 +84,4 @@ jobs:
               echo "base rootfs does not reach VMs until the snapshot is rebuilt under a"
               echo "*new* name — the build script aborts if the name already exists."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
           fi

@@ -1,17 +1,18 @@
 name: Probe image identity and baked environment
 
-# Answers two questions about the VM a job actually landed on:
+# Two questions about the VM a job actually landed on:
 #
 #   1. Which base image lineage is this - runner-images or the sandbox image
-#      chain? Needed because the runner/sandbox VM-layer merge (CLO-4333) puts
-#      both behind the same dispatch, and picking the wrong base_image_id is
-#      silent: the job runs, it just runs somewhere unintended.
+#      chain? The runner/sandbox VM-layer merge (CLO-4333) puts both behind the
+#      same dispatch, and picking the wrong base_image_id is silent: the job
+#      runs, it just runs somewhere unintended.
 #
-#   2. Do the toolchain variables runner-images bakes into /etc/environment
-#      still reach a job? guest-agent rewrites that file wholesale on every
-#      session activation (guestagent/activate_linux.go), so on the new path
-#      anything delivered through it is gone. ~/actions-runner/.env is the copy
-#      guest-agent does not touch, and it is baked with PATH only.
+#   2. Do the ~47 toolchain variables runner-images bakes into /etc/environment
+#      reach a job? Nothing loads that file automatically. The old stack's
+#      vm-agent.service declares EnvironmentFile=-/etc/environment and passes
+#      its own environment down to the runner; guest-agent.service declares no
+#      such thing, and guest-agent additionally rewrites the file on every
+#      session activation. This probe names the mechanism actually in play.
 #
 # Report-only: never fails the job. Prints KEY NAMES only for /etc/environment
 # and .env - this repository is public and a session's environment may carry
@@ -30,16 +31,47 @@ jobs:
   probe:
     runs-on: ${{ inputs.runner_label || 'tenki-standard-autoscale' }}
     steps:
+      - name: Which base image is this
+        run: |
+          set -u
+          # The discriminator. /imagegeneration/imagedata.json is written by
+          # runner-images' configure-image-data.sh and nothing in the sandbox
+          # image chain creates that path. It is a regular file, so unlike the
+          # ImageVersion env var it survives guest-agent's session activation.
+          if [ -f /imagegeneration/imagedata.json ]; then
+            if [ -f /etc/tenki-guest-agent-version ]; then
+              LINEAGE="runner image, sandbox variant"
+            else
+              LINEAGE="runner image, stock (old stack)"
+            fi
+            VERSION=$(jq -r '.[]|select(.group=="Runner Image")|.detail' \
+                        /imagegeneration/imagedata.json 2>/dev/null \
+                      | sed -n 's/^Version: //p')
+          else
+            LINEAGE="sandbox image chain"
+            VERSION="n/a"
+          fi
+          echo "lineage = $LINEAGE"
+          echo "image version = ${VERSION:-unknown}"
+          echo "lineage=$LINEAGE"        >> "$GITHUB_OUTPUT"
+          echo "image_version=$VERSION"  >> "$GITHUB_OUTPUT"
+
+          # Markers that do NOT discriminate - measured, listed so nobody
+          # reuses them. waagent.conf is absent on the local-CloudHypervisor
+          # build lane; invoke_tests is a symlink whose target is cleaned at
+          # build time; /usr/local/bin/sandbox (guest-agent) is baked into the
+          # runner variant too, so it carries no lineage information at all.
+          echo
+          echo "--- non-discriminating markers, for the record ---"
+          for p in /etc/waagent.conf /usr/local/bin/invoke_tests /usr/local/bin/sandbox; do
+            if [ -e "$p" ]; then printf 'PRESENT  %s\n' "$p"; else printf 'absent   %s\n' "$p"; fi
+          done
+
       - name: Image lineage markers
         run: |
           set -u
-          # runner-images bakes the first five; the sandbox image chain bakes
-          # none of them. The sandbox variant of the runner image adds the
-          # tenki-* markers on top, so those separate "converted" from "stock".
           for p in /imagegeneration/imagedata.json \
                    /opt/hostedtoolcache \
-                   /etc/waagent.conf \
-                   /usr/local/bin/invoke_tests \
                    "$HOME/actions-runner/run.sh" \
                    /etc/tenki-guest-agent-version \
                    /etc/cloud/cloud.cfg.d/99-tenki-datasource.cfg \
@@ -48,62 +80,97 @@ jobs:
                    /usr/local/bin/vm-agent; do
             if [ -e "$p" ]; then printf 'PRESENT  %s\n' "$p"; else printf 'absent   %s\n' "$p"; fi
           done
-
           echo
           echo "--- /imagegeneration/imagedata.json ---"
           cat /imagegeneration/imagedata.json 2>/dev/null || echo "(not present)"
 
-          echo
-          echo "--- candidate discriminator ---"
-          if [ -f /imagegeneration/imagedata.json ]; then
-            echo "verdict = runner-images lineage"
-          else
-            echo "verdict = NOT runner-images lineage"
-          fi
-
       - name: Baked environment as the job sees it
         run: |
           set -u
-          # Allowlisted because every one of these is a path, a version or a
-          # boolean - no credentials.
-          for v in ImageVersion ImageOS ImageVersionFull \
+          # Allowlisted: every one is a path, a version or a boolean. No secrets.
+          for v in ImageVersion ImageOS \
                    RUNNER_TOOL_CACHE AGENT_TOOLSDIRECTORY \
-                   JAVA_HOME ANDROID_SDK_ROOT ANDROID_NDK GRADLE_HOME ANT_HOME \
-                   CONDA VCPKG_INSTALLATION_ROOT SWIFT_PATH LEIN_HOME \
-                   CHROMEWEBDRIVER GECKOWEBDRIVER EDGEWEBDRIVER SELENIUM_JAR_PATH \
-                   DOTNET_NOLOGO DOTNET_MULTILEVEL_LOOKUP PIPX_HOME PIPX_BIN_DIR \
-                   ACCEPT_EULA XDG_CONFIG_HOME NVM_DIR; do
+                   JAVA_HOME JAVA_HOME_17_X64 ANDROID_SDK_ROOT ANDROID_NDK \
+                   GRADLE_HOME ANT_HOME CONDA VCPKG_INSTALLATION_ROOT SWIFT_PATH \
+                   CHROME_BIN CHROMEWEBDRIVER GECKOWEBDRIVER SELENIUM_JAR_PATH \
+                   DOTNET_NOLOGO PIPX_HOME PIPX_BIN_DIR NVM_DIR \
+                   ACCEPT_EULA XDG_CONFIG_HOME ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE; do
             if [ -z "${!v+x}" ]; then
-              printf '%-26s <UNSET>\n' "$v"
+              printf '%-36s <UNSET>\n' "$v"
             else
-              printf '%-26s %s\n' "$v" "${!v}"
+              printf '%-36s %s\n' "$v" "${!v}"
             fi
           done
 
-      - name: /etc/environment key names on disk
+      - name: Who loads /etc/environment
         run: |
           set -u
-          f=/etc/environment
-          if [ ! -f "$f" ]; then echo "(no $f)"; exit 0; fi
-          echo "lines = $(wc -l < "$f")"
-          echo "--- key names only (values withheld: public log) ---"
-          sudo grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" 2>/dev/null | tr -d '=' | sort || \
-            grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" | tr -d '=' | sort
+          # /etc/environment is not loaded by anything automatically. systemd
+          # does not read it for services; only a unit that declares
+          # EnvironmentFile= for it, or PAM's pam_env for LOGIN sessions, does.
+          # This step names whichever mechanism is in play on this VM - it is
+          # the whole reason the baked toolchain vars reach a job or do not.
+          #
+          # Directive names and EnvironmentFile paths only: this log is public
+          # and a unit may carry tokens in Environment= lines.
+          echo "--- /etc/environment on disk ---"
+          echo "keys = $(sudo grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' /etc/environment 2>/dev/null || echo 0)"
+          echo "key names (values withheld):"
+          sudo grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' /etc/environment 2>/dev/null | tr -d '=' | sort | tr '\n' ' '
+          echo
 
-      - name: actions-runner/.env key names on disk
+          echo
+          echo "--- actions-runner/.env on disk (guest-agent never rewrites this one) ---"
+          f="$HOME/actions-runner/.env"
+          if [ -f "$f" ]; then
+            echo "keys = $(grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' "$f")"
+            grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" | tr -d '=' | sort | tr '\n' ' '
+            echo
+          else
+            echo "(no $f)"
+          fi
+
+          echo
+          echo "--- units declaring EnvironmentFile for /etc/environment ---"
+          sudo grep -rl 'EnvironmentFile=.*etc/environment' /etc/systemd 2>/dev/null || echo "(NONE - nothing loads it)"
+
+          echo
+          echo "--- agent units ---"
+          for u in /etc/systemd/system/vm-agent.service /etc/systemd/system/guest-agent.service; do
+            if sudo test -f "$u"; then
+              echo "== $u"
+              sudo grep -E '^(Type|User|Group|ExecStart|EnvironmentFile)=' "$u" || true
+            else
+              echo "== $u (absent)"
+            fi
+          done
+
+          echo
+          echo "--- manager-level fallback ---"
+          sudo grep -rhn '^DefaultEnvironment' /etc/systemd/system.conf /etc/systemd/system.conf.d/ 2>/dev/null \
+            || echo "(DefaultEnvironment not set - no fallback)"
+
+      - name: Does the agent process actually carry the baked vars
         run: |
           set -u
-          f="$HOME/actions-runner/.env"
-          if [ ! -f "$f" ]; then echo "(no $f)"; exit 0; fi
-          echo "lines = $(wc -l < "$f")"
-          echo "--- key names only (values withheld: public log) ---"
-          grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" | tr -d '=' | sort
+          # The measurement that closes the loop: whichever agent launched the
+          # runner passes its own os.Environ() down, so JAVA_HOME being present
+          # in THAT process is what puts it in the job.
+          for name in vm-agent sandbox; do
+            pid=$(pgrep -x "$name" | head -1 || true)
+            if [ -z "${pid:-}" ]; then echo "$name: no process"; continue; fi
+            echo "== $name pid=$pid"
+            n=$(sudo cat "/proc/$pid/environ" | tr '\0' '\n' | grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' || true)
+            echo "   env entries      = $n"
+            for v in JAVA_HOME RUNNER_TOOL_CACHE ImageVersion; do
+              hit=$(sudo cat "/proc/$pid/environ" | tr '\0' '\n' | grep -c "^${v}=" || true)
+              echo "   $v carried = $hit"
+            done
+          done
 
       - name: Toolcache reachability
         run: |
           set -u
-          # The point of the 5.4G prebaked toolcache is that setup-* actions
-          # find it. They locate it through RUNNER_TOOL_CACHE.
           echo "RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-<UNSET>}"
           if [ -d /opt/hostedtoolcache ]; then
             echo "hostedtoolcache on disk: $(du -sh /opt/hostedtoolcache 2>/dev/null | cut -f1)"
@@ -117,52 +184,25 @@ jobs:
         run: |
           set -u
           {
-            echo "### Image identity"
+            echo "### Base image"
             echo
             echo "| probe | value |"
             echo "| --- | --- |"
             echo "| imagedata.json | $([ -f /imagegeneration/imagedata.json ] && echo present || echo absent) |"
+            echo "| tenki-guest-agent-version | $([ -f /etc/tenki-guest-agent-version ] && echo present || echo absent) |"
             echo "| hostedtoolcache | $([ -d /opt/hostedtoolcache ] && echo present || echo absent) |"
             echo "| guest-agent binary | $([ -x /usr/local/bin/sandbox ] && echo present || echo absent) |"
             echo "| vm-agent binary | $([ -x /usr/local/bin/vm-agent ] && echo present || echo absent) |"
-            echo "| ImageVersion in job env | ${ImageVersion:-<UNSET>} |"
-            echo "| RUNNER_TOOL_CACHE in job env | ${RUNNER_TOOL_CACHE:-<UNSET>} |"
-            echo "| JAVA_HOME in job env | ${JAVA_HOME:-<UNSET>} |"
-            echo "| runner | $(hostname) |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: How the old stack delivers /etc/environment
-        run: |
-          set -u
-          # Directive names and EnvironmentFile paths only. Values of
-          # Environment= lines are withheld - this log is public and the unit
-          # may carry tokens.
-          u=/etc/systemd/system/vm-agent.service
-          echo "--- $u ---"
-          if sudo test -f "$u"; then
-            sudo grep -E '^(Type|User|Group|PAMName|WorkingDirectory|EnvironmentFile|ExecStart)=' "$u" || true
-            echo "Environment= keys: $(sudo grep -oE '^Environment=[A-Za-z_][A-Za-z0-9_]*' "$u" | sed 's/^Environment=//' | tr '\n' ' ')"
-          else
-            echo "(absent)"
-          fi
-
-          echo
-          echo "--- units referencing /etc/environment ---"
-          sudo grep -rl 'etc/environment' /etc/systemd 2>/dev/null || echo "(none)"
-
-          echo
-          echo "--- systemd manager DefaultEnvironment ---"
-          sudo grep -rn 'DefaultEnvironment' /etc/systemd/system.conf /etc/systemd/system.conf.d/ 2>/dev/null | cut -c1-120 || echo "(none)"
-
-          echo
-          echo "--- vm-agent process env: does it carry the baked vars? ---"
-          pid=$(pgrep -x vm-agent | head -1 || true)
-          if [ -n "${pid:-}" ]; then
-            echo "vm-agent pid = $pid"
-            echo "key names in its environ:"
-            sudo tr '\0' '\n' < "/proc/$pid/environ" | grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' | tr -d '=' | sort | tr '\n' ' '
             echo
-            echo "JAVA_HOME present in vm-agent environ: $(sudo tr '\0' '\n' < /proc/$pid/environ | grep -c '^JAVA_HOME=')"
-          else
-            echo "(no vm-agent process)"
-          fi
+            echo "### Baked environment reaching this job"
+            echo
+            echo "| var | value |"
+            echo "| --- | --- |"
+            echo "| ImageVersion | ${ImageVersion:-<UNSET>} |"
+            echo "| RUNNER_TOOL_CACHE | ${RUNNER_TOOL_CACHE:-<UNSET>} |"
+            echo "| JAVA_HOME | ${JAVA_HOME:-<UNSET>} |"
+            echo "| ANDROID_SDK_ROOT | ${ANDROID_SDK_ROOT:-<UNSET>} |"
+            echo "| CHROMEWEBDRIVER | ${CHROMEWEBDRIVER:-<UNSET>} |"
+            echo
+            echo "runner: \`$(hostname)\`"
+          } >> "$GITHUB_STEP_SUMMARY"

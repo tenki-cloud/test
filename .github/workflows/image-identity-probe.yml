@@ -1,0 +1,132 @@
+name: Probe image identity and baked environment
+
+# Answers two questions about the VM a job actually landed on:
+#
+#   1. Which base image lineage is this - runner-images or the sandbox image
+#      chain? Needed because the runner/sandbox VM-layer merge (CLO-4333) puts
+#      both behind the same dispatch, and picking the wrong base_image_id is
+#      silent: the job runs, it just runs somewhere unintended.
+#
+#   2. Do the toolchain variables runner-images bakes into /etc/environment
+#      still reach a job? guest-agent rewrites that file wholesale on every
+#      session activation (guestagent/activate_linux.go), so on the new path
+#      anything delivered through it is gone. ~/actions-runner/.env is the copy
+#      guest-agent does not touch, and it is baked with PATH only.
+#
+# Report-only: never fails the job. Prints KEY NAMES only for /etc/environment
+# and .env - this repository is public and a session's environment may carry
+# credentials. Values are printed only for an explicit non-sensitive allowlist.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: "Runner pool to probe"
+        required: false
+        default: "tenki-standard-autoscale"
+        type: string
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner_label || 'tenki-standard-autoscale' }}
+    steps:
+      - name: Image lineage markers
+        run: |
+          set -u
+          # runner-images bakes the first five; the sandbox image chain bakes
+          # none of them. The sandbox variant of the runner image adds the
+          # tenki-* markers on top, so those separate "converted" from "stock".
+          for p in /imagegeneration/imagedata.json \
+                   /opt/hostedtoolcache \
+                   /etc/waagent.conf \
+                   /usr/local/bin/invoke_tests \
+                   "$HOME/actions-runner/run.sh" \
+                   /etc/tenki-guest-agent-version \
+                   /etc/cloud/cloud.cfg.d/99-tenki-datasource.cfg \
+                   /etc/sysctl.d/99-tenki-pids.conf \
+                   /usr/local/bin/sandbox \
+                   /usr/local/bin/vm-agent; do
+            if [ -e "$p" ]; then printf 'PRESENT  %s\n' "$p"; else printf 'absent   %s\n' "$p"; fi
+          done
+
+          echo
+          echo "--- /imagegeneration/imagedata.json ---"
+          cat /imagegeneration/imagedata.json 2>/dev/null || echo "(not present)"
+
+          echo
+          echo "--- candidate discriminator ---"
+          if [ -f /imagegeneration/imagedata.json ]; then
+            echo "verdict = runner-images lineage"
+          else
+            echo "verdict = NOT runner-images lineage"
+          fi
+
+      - name: Baked environment as the job sees it
+        run: |
+          set -u
+          # Allowlisted because every one of these is a path, a version or a
+          # boolean - no credentials.
+          for v in ImageVersion ImageOS ImageVersionFull \
+                   RUNNER_TOOL_CACHE AGENT_TOOLSDIRECTORY \
+                   JAVA_HOME ANDROID_SDK_ROOT ANDROID_NDK GRADLE_HOME ANT_HOME \
+                   CONDA VCPKG_INSTALLATION_ROOT SWIFT_PATH LEIN_HOME \
+                   CHROMEWEBDRIVER GECKOWEBDRIVER EDGEWEBDRIVER SELENIUM_JAR_PATH \
+                   DOTNET_NOLOGO DOTNET_MULTILEVEL_LOOKUP PIPX_HOME PIPX_BIN_DIR \
+                   ACCEPT_EULA XDG_CONFIG_HOME NVM_DIR; do
+            if [ -z "${!v+x}" ]; then
+              printf '%-26s <UNSET>\n' "$v"
+            else
+              printf '%-26s %s\n' "$v" "${!v}"
+            fi
+          done
+
+      - name: /etc/environment key names on disk
+        run: |
+          set -u
+          f=/etc/environment
+          if [ ! -f "$f" ]; then echo "(no $f)"; exit 0; fi
+          echo "lines = $(wc -l < "$f")"
+          echo "--- key names only (values withheld: public log) ---"
+          sudo grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" 2>/dev/null | tr -d '=' | sort || \
+            grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" | tr -d '=' | sort
+
+      - name: actions-runner/.env key names on disk
+        run: |
+          set -u
+          f="$HOME/actions-runner/.env"
+          if [ ! -f "$f" ]; then echo "(no $f)"; exit 0; fi
+          echo "lines = $(wc -l < "$f")"
+          echo "--- key names only (values withheld: public log) ---"
+          grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" | tr -d '=' | sort
+
+      - name: Toolcache reachability
+        run: |
+          set -u
+          # The point of the 5.4G prebaked toolcache is that setup-* actions
+          # find it. They locate it through RUNNER_TOOL_CACHE.
+          echo "RUNNER_TOOL_CACHE=${RUNNER_TOOL_CACHE:-<UNSET>}"
+          if [ -d /opt/hostedtoolcache ]; then
+            echo "hostedtoolcache on disk: $(du -sh /opt/hostedtoolcache 2>/dev/null | cut -f1)"
+            ls /opt/hostedtoolcache 2>/dev/null | head -20
+          else
+            echo "hostedtoolcache: absent"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          set -u
+          {
+            echo "### Image identity"
+            echo
+            echo "| probe | value |"
+            echo "| --- | --- |"
+            echo "| imagedata.json | $([ -f /imagegeneration/imagedata.json ] && echo present || echo absent) |"
+            echo "| hostedtoolcache | $([ -d /opt/hostedtoolcache ] && echo present || echo absent) |"
+            echo "| guest-agent binary | $([ -x /usr/local/bin/sandbox ] && echo present || echo absent) |"
+            echo "| vm-agent binary | $([ -x /usr/local/bin/vm-agent ] && echo present || echo absent) |"
+            echo "| ImageVersion in job env | ${ImageVersion:-<UNSET>} |"
+            echo "| RUNNER_TOOL_CACHE in job env | ${RUNNER_TOOL_CACHE:-<UNSET>} |"
+            echo "| JAVA_HOME in job env | ${JAVA_HOME:-<UNSET>} |"
+            echo "| runner | $(hostname) |"
+          } >> "$GITHUB_STEP_SUMMARY"

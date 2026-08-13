@@ -130,3 +130,39 @@ jobs:
             echo "| JAVA_HOME in job env | ${JAVA_HOME:-<UNSET>} |"
             echo "| runner | $(hostname) |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: How the old stack delivers /etc/environment
+        run: |
+          set -u
+          # Directive names and EnvironmentFile paths only. Values of
+          # Environment= lines are withheld - this log is public and the unit
+          # may carry tokens.
+          u=/etc/systemd/system/vm-agent.service
+          echo "--- $u ---"
+          if sudo test -f "$u"; then
+            sudo grep -E '^(Type|User|Group|PAMName|WorkingDirectory|EnvironmentFile|ExecStart)=' "$u" || true
+            echo "Environment= keys: $(sudo grep -oE '^Environment=[A-Za-z_][A-Za-z0-9_]*' "$u" | sed 's/^Environment=//' | tr '\n' ' ')"
+          else
+            echo "(absent)"
+          fi
+
+          echo
+          echo "--- units referencing /etc/environment ---"
+          sudo grep -rl 'etc/environment' /etc/systemd 2>/dev/null || echo "(none)"
+
+          echo
+          echo "--- systemd manager DefaultEnvironment ---"
+          sudo grep -rn 'DefaultEnvironment' /etc/systemd/system.conf /etc/systemd/system.conf.d/ 2>/dev/null | cut -c1-120 || echo "(none)"
+
+          echo
+          echo "--- vm-agent process env: does it carry the baked vars? ---"
+          pid=$(pgrep -x vm-agent | head -1 || true)
+          if [ -n "${pid:-}" ]; then
+            echo "vm-agent pid = $pid"
+            echo "key names in its environ:"
+            sudo tr '\0' '\n' < "/proc/$pid/environ" | grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' | tr -d '=' | sort | tr '\n' ' '
+            echo
+            echo "JAVA_HOME present in vm-agent environ: $(sudo tr '\0' '\n' < /proc/$pid/environ | grep -c '^JAVA_HOME=')"
+          else
+            echo "(no vm-agent process)"
+          fi

@@ -187,3 +187,18 @@ jobs:
           echo
           echo "--- was this runner started with --disableupdate? ---"
           ps -eo args --no-headers | grep -E "Runner.Listener|run\.sh" | grep -v grep | sed 's/--jitconfig [^ ]*/--jitconfig <redacted>/g' | head -5
+
+      - name: Did ansible inject the runner tarball into this rootfs
+        run: |
+          set -u
+          # tenki-ansible's runner-tarball-inject.yml overwrites ~/actions-runner
+          # from a freshly downloaded tarball and drops this marker. Its presence
+          # means the running runner came from that step, not from the image build.
+          f="$HOME/actions-runner/.tenki-runner-version"
+          echo -n "ansible inject marker: "
+          [ -f "$f" ] && cat "$f" || echo "ABSENT"
+          echo "runner file mtimes (tarball contents keep their archive mtime):"
+          stat -c '  %y  %n' "$HOME"/actions-runner/bin/Runner.Listener "$HOME"/actions-runner/run.sh 2>/dev/null
+          sudo stat -c '  %y  %n' /opt/runner-cache/*.tar.gz 2>/dev/null
+          echo -n "Runner.Worker.dll patched (ACTIONS_RESULTS_ORL): "
+          grep -acoP 'A\x00C\x00T\x00I\x00O\x00N\x00S\x00_\x00R\x00E\x00S\x00U\x00L\x00T\x00S\x00_\x00O\x00R\x00L\x00' "$HOME/actions-runner/bin/Runner.Worker.dll" 2>/dev/null || echo "?"

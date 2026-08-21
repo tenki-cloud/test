@@ -17,6 +17,9 @@ name: macOS SKU probe
 # error. This repository is public, so no environment dump - only an explicit
 # allowlist of non-sensitive variables is printed.
 #
+# Defaults to the mini SKU on both OS lines, the pair that schedules soonest.
+# Larger sizes are enabled per workspace, so pass them explicitly:
+#
 # Run it:  Actions tab -> "macOS SKU probe" -> Run workflow
 #     or:  gh workflow run macos-sku-probe.yml
 #          gh workflow run macos-sku-probe.yml -f labels='["tenki-macos-26-small"]'
@@ -26,7 +29,7 @@ on:
     inputs:
       labels:
         description: JSON array of macOS runner labels to probe
-        default: '["tenki-macos-26-small","tenki-macos-latest-small","tenki-macos-26-mini","tenki-macos-latest-mini"]'
+        default: '["tenki-macos-26-mini","tenki-macos-latest-mini"]'
         type: string
       write_test_mb:
         description: Sequential write test size in MB (0 skips it)

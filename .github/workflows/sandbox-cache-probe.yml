@@ -78,37 +78,46 @@ jobs:
           set +e
           GW=$(ip route | awk '/^default/{print $3; exit}')
           SRC=$(ip route get "$GW" | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
-          CACHE_IP=$(awk '/tenki-managed-hosts-begin/{f=1;next} /tenki-managed-hosts-end/{f=0} f && NF {print $1; exit}' /etc/hosts)
+          BLOCK=$(awk '/tenki-managed-hosts-begin/{f=1;next} /tenki-managed-hosts-end/{f=0} f && NF' /etc/hosts)
+          CACHE_IP=$(printf '%s\n' "$BLOCK" | awk 'NF{print $1; exit}')
+          NAMES=$(printf '%s\n' "$BLOCK" | awk '{for (i=2;i<=NF;i++) print $i}' | sort -u)
+          echo "managed_hostnames=$(printf '%s\n' "$NAMES" | grep -c .)"
 
           echo "== from inside a container"
-          docker run --rm -e GW="$GW" -e CACHE_IP="$CACHE_IP" curlimages/curl:latest sh -c '
-            probe() {
-              curl -sS -o /dev/null --connect-timeout 3 --max-time 8 "$1" >/dev/null 2>&1
-              case "$?" in
-                0) echo answered ;;
-                7) echo refused_or_unreachable ;;
-                28) echo timeout ;;
-                6) echo dns_failed ;;
-                *) echo "curl_rc_$?" ;;
+          docker run --rm -e GW="$GW" -e CACHE_IP="$CACHE_IP" -e NAMES="$NAMES" \
+            curlimages/curl:latest sh -c '
+            classify() {
+              err=$(curl -sS -o /dev/null --connect-timeout 3 --max-time 8 "$1" 2>&1); rc=$?
+              if [ "$rc" = 0 ]; then echo answered; return; fi
+              case "$err" in
+                *"Connection refused"*) echo refused_reached_peer ;;
+                *"No route to host"*|*"Network is unreachable"*) echo no_route ;;
+                *"Could not resolve"*) echo dns_failed ;;
+                *"timed out"*|*"Timeout"*) echo timeout ;;
+                *) echo "other_rc_$rc" ;;
               esac
             }
-            echo "container_to_gateway_49193=$(probe "http://$GW:49193/")"
-            echo "container_to_cache_by_ip=$(probe "http://$CACHE_IP:6990/health")"
-            echo "container_resolves_cache_hostname=$(getent hosts ci.cache.tenki.cloud >/dev/null 2>&1 && echo yes || echo no)"
-          '
+            echo "container_to_gateway_49193=$(classify "http://$GW:49193/")"
+            echo "container_to_gateway_49194=$(classify "http://$GW:49194/")"
+            echo "container_to_cache_by_ip=$(classify "http://$CACHE_IP:6990/health")"
+            n=0; ok=0
+            for h in $NAMES; do
+              n=$((n+1))
+              if getent hosts "$h" >/dev/null 2>&1; then ok=$((ok+1)); fi
+            done
+            echo "container_resolvable_managed_hostnames=$ok/$n"
+            '
 
-          echo "== source-address translation, read on the guest"
-          L=$(sudo grep -m1 "dport=6990" /proc/net/nf_conntrack 2>/dev/null)
+          echo "== source-address translation for the container connection, read on the guest"
+          L=$(sudo grep "dport=6990" /proc/net/nf_conntrack 2>/dev/null \
+              | grep -E 'src=(172\.1[6-9]|172\.2[0-9]|172\.3[01])\.' | head -1)
           if [ -z "$L" ]; then
-            echo "conntrack_entry=absent"
+            echo "container_conntrack_entry=absent"
           else
             ORIG_SRC=$(printf '%s' "$L" | grep -o 'src=[0-9.]*' | head -1 | cut -d= -f2)
             REPLY_DST=$(printf '%s' "$L" | grep -o 'dst=[0-9.]*' | tail -1 | cut -d= -f2)
-            echo "conntrack_entry=present"
-            echo "orig_src_was_container_subnet=$(printf '%s' "$ORIG_SRC" | grep -qE '^(172\.1[6-9]|172\.2[0-9]|172\.3[01])\.' && echo yes || echo no)"
+            echo "container_conntrack_entry=present"
             echo "source_was_translated=$([ "$ORIG_SRC" != "$REPLY_DST" ] && echo yes || echo no)"
             echo "translated_to_guest_egress_addr=$([ "$REPLY_DST" = "$SRC" ] && echo yes || echo no)"
           fi
-
-          echo "== docker masquerade rule present"
-          echo "postrouting_masquerade=$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -c MASQUERADE)"
+          echo "postrouting_masquerade_rules=$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -c MASQUERADE)"

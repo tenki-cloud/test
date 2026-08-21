@@ -17,8 +17,10 @@ name: macOS SKU probe
 # error. This repository is public, so no environment dump - only an explicit
 # allowlist of non-sensitive variables is printed.
 #
-# Defaults to the mini SKU on both OS lines, the pair that schedules soonest.
-# Larger sizes are enabled per workspace, so pass them explicitly:
+# This account has no payment method, which caps it at the mini macOS SKU and
+# the 2c/4g Linux SKU. Anything larger is admitted by GitHub, then sits queued
+# until it is cancelled - so the defaults here stay at that ceiling, and the
+# summary job runs on tenki-standard-small-2c-4g for the same reason.
 #
 # Run it:  Actions tab -> "macOS SKU probe" -> Run workflow
 #     or:  gh workflow run macos-sku-probe.yml

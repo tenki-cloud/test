@@ -1,0 +1,114 @@
+# Probe for CLO-4333: can a container inside the guest reach the host side of the
+# session /31, and what source address does that traffic carry when it gets there?
+# Prints verdicts only — this repo and its logs are public.
+name: sandbox cache probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  host:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - name: guest network and cache config
+        run: |
+          set +e
+          GW=$(ip route | awk '/^default/{print $3; exit}')
+          SRC=$(ip route get "$GW" | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+          echo "default_gateway_found=$([ -n "$GW" ] && echo yes || echo no)"
+          echo "egress_src_found=$([ -n "$SRC" ] && echo yes || echo no)"
+          echo "gateway_is_31_peer_of_src=$([ "${GW%.*}" = "${SRC%.*}" ] && echo yes || echo no)"
+
+          probe() {
+            curl -sS -o /dev/null --connect-timeout 3 --max-time 8 "$1" >/dev/null 2>&1
+            case "$?" in
+              0) echo answered ;;
+              7) echo refused_or_unreachable ;;
+              28) echo timeout ;;
+              6) echo dns_failed ;;
+              *) echo "curl_rc_$?" ;;
+            esac
+          }
+          echo "host_to_gateway_49193=$(probe "http://$GW:49193/")"
+          echo "host_to_gateway_49194=$(probe "http://$GW:49194/")"
+
+          HOSTS=$(awk '/tenki-managed-hosts-begin/{f=1;next} /tenki-managed-hosts-end/{f=0} f' /etc/hosts)
+          echo "managed_hosts_block=$([ -n "$HOSTS" ] && echo present || echo absent)"
+          echo "managed_hosts_entries=$(printf '%s\n' "$HOSTS" | grep -c .)"
+          echo "managed_hosts_distinct_ips=$(printf '%s\n' "$HOSTS" | awk '{print $1}' | sort -u | grep -c .)"
+          CACHE_IP=$(printf '%s\n' "$HOSTS" | awk 'NF{print $1; exit}')
+          echo "host_to_cache_health=$(probe "http://$CACHE_IP:6990/health")"
+
+      - name: actions cache endpoint the job actually sees
+        run: |
+          set +e
+          SRC=$(ip route get "$(ip route | awk '/^default/{print $3; exit}')" \
+                | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+          echo "ACTIONS_RESULTS_URL_set=$(env | grep -c '^ACTIONS_RESULTS_URL=')"
+          echo "ACTIONS_CACHE_URL_set=$(env | grep -c '^ACTIONS_CACHE_URL=')"
+          echo "TENKI_CACHE_URL_set=$(env | grep -c '^TENKI_CACHE_URL=')"
+          H=$(env | grep -m1 '^ACTIONS_RESULTS_URL=' | sed 's|.*://||; s|[:/].*||')
+          echo "results_url_host_kind=$(printf '%s' "$H" | grep -qE '^[0-9.]+$' && echo ip || { [ -n "$H" ] && echo hostname || echo unset; })"
+          echo "results_url_points_at_guest=$([ -n "$H" ] && [ "$H" = "$SRC" ] && echo yes || echo no)"
+          echo "results_url_is_github=$(printf '%s' "$H" | grep -qi 'github' && echo yes || echo no)"
+
+      - run: mkdir -p probe-payload
+
+      - uses: actions/cache@v4
+        with:
+          path: probe-payload
+          key: sandbox-probe-${{ github.run_id }}
+
+      - name: hook file timing
+        run: |
+          set +e
+          date -u +'cache_step_finished_at=%Y-%m-%dT%H:%M:%S.%3NZ'
+          stat -c 'hook_file_mtime=%y' /tmp/current_job_info.json 2>/dev/null || echo "hook_file_mtime=absent"
+          echo "hook_fields_present=$(sudo grep -o '"github_[a-z_]*"' /tmp/current_job_info.json 2>/dev/null | sort -u | wc -l)"
+          echo "hook_has_ref_type=$(sudo grep -c 'github_ref_type' /tmp/current_job_info.json 2>/dev/null)"
+          echo "hook_has_head_ref=$(sudo grep -c 'github_head_ref' /tmp/current_job_info.json 2>/dev/null)"
+          echo "hook_has_base_ref=$(sudo grep -c 'github_base_ref' /tmp/current_job_info.json 2>/dev/null)"
+          date -u > probe-payload/stamp
+
+  container_source:
+    runs-on: tenki-standard-autoscale
+    steps:
+      - name: what a host-side listener would see from a container
+        run: |
+          set +e
+          GW=$(ip route | awk '/^default/{print $3; exit}')
+          SRC=$(ip route get "$GW" | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+          CACHE_IP=$(awk '/tenki-managed-hosts-begin/{f=1;next} /tenki-managed-hosts-end/{f=0} f && NF {print $1; exit}' /etc/hosts)
+
+          echo "== from inside a container"
+          docker run --rm -e GW="$GW" -e CACHE_IP="$CACHE_IP" curlimages/curl:latest sh -c '
+            probe() {
+              curl -sS -o /dev/null --connect-timeout 3 --max-time 8 "$1" >/dev/null 2>&1
+              case "$?" in
+                0) echo answered ;;
+                7) echo refused_or_unreachable ;;
+                28) echo timeout ;;
+                6) echo dns_failed ;;
+                *) echo "curl_rc_$?" ;;
+              esac
+            }
+            echo "container_to_gateway_49193=$(probe "http://$GW:49193/")"
+            echo "container_to_cache_by_ip=$(probe "http://$CACHE_IP:6990/health")"
+            echo "container_resolves_cache_hostname=$(getent hosts ci.cache.tenki.cloud >/dev/null 2>&1 && echo yes || echo no)"
+          '
+
+          echo "== source-address translation, read on the guest"
+          L=$(sudo grep -m1 "dport=6990" /proc/net/nf_conntrack 2>/dev/null)
+          if [ -z "$L" ]; then
+            echo "conntrack_entry=absent"
+          else
+            ORIG_SRC=$(printf '%s' "$L" | grep -o 'src=[0-9.]*' | head -1 | cut -d= -f2)
+            REPLY_DST=$(printf '%s' "$L" | grep -o 'dst=[0-9.]*' | tail -1 | cut -d= -f2)
+            echo "conntrack_entry=present"
+            echo "orig_src_was_container_subnet=$(printf '%s' "$ORIG_SRC" | grep -qE '^(172\.1[6-9]|172\.2[0-9]|172\.3[01])\.' && echo yes || echo no)"
+            echo "source_was_translated=$([ "$ORIG_SRC" != "$REPLY_DST" ] && echo yes || echo no)"
+            echo "translated_to_guest_egress_addr=$([ "$REPLY_DST" = "$SRC" ] && echo yes || echo no)"
+          fi
+
+          echo "== docker masquerade rule present"
+          echo "postrouting_masquerade=$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -c MASQUERADE)"

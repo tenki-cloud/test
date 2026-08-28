@@ -1,0 +1,110 @@
+name: Node Disk Probe (8c16g)
+
+# 同一个标签重复跑相同负载,事后用 engine 的 "runner provisioned" 日志把
+# RUNNER_NAME 映射到 node_id,再按节点对比。
+#
+# 要回答的问题:lbm-19-10(FireCuda 520 / PCIe 3.0,池内唯一上一代接口)
+# 是否稳定慢于其他 premium 节点。客户 08-27 那批数据里它 +71%(vs blacksmith),
+# 而 lbm-19-5/6/7 只有 +13%,但每个节点只有 4-9 个样本,不足以定论。
+#
+# 标签固定 8c16g,与客户 constructive-io 的主力规格一致。
+# 每行结果都以 PROBE| 开头,便于事后 grep 汇总。
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: probe-${{ matrix.idx }}
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    runs-on: tenki-standard-large-8c-16g
+    timeout-minutes: 25
+
+    steps:
+      - name: Identity
+        run: |
+          set +e
+          echo "PROBE|idx|${{ matrix.idx }}"
+          echo "PROBE|runner|${RUNNER_NAME}"
+          echo "PROBE|nproc|$(nproc)"
+          echo "PROBE|mem_gb|$(free -g | awk '/^Mem:/{print $2}')"
+          echo "PROBE|cpu_model|$(lscpu | awk -F: '/^Model name/{gsub(/^ +/,"",$2); print $2}')"
+          echo "PROBE|cpu_lscpu|$(lscpu | awk -F: '/^CPU\(s\)/{gsub(/ /,"",$2); print $2; exit}')"
+          echo "PROBE|boot_time|$(date -u +%H:%M:%S)"
+          # nproc 与标签不符即为 vCPU 扩容失败,单独标记出来
+          if [ "$(nproc)" != "8" ]; then echo "PROBE|SCALEUP_FAILED|$(nproc)"; fi
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends fio sysbench
+
+      - name: CPU control — single thread
+        run: |
+          v=$(sysbench cpu --threads=1 --time=10 --cpu-max-prime=20000 run \
+              | awk '/events per second/{print $4}')
+          echo "PROBE|cpu_single_eps|$v"
+
+      - name: CPU control — all threads
+        run: |
+          v=$(sysbench cpu --threads="$(nproc)" --time=10 --cpu-max-prime=20000 run \
+              | awk '/events per second/{print $4}')
+          echo "PROBE|cpu_all_eps|$v"
+
+      - name: Disk — randread 4k qd32 (direct)
+        run: |
+          mkdir -p ./.fio
+          fio --name=rr --rw=randread --bs=4k --iodepth=32 --size=1G \
+              --runtime=15 --time_based --filename=./.fio/rr \
+              --direct=1 --group_reporting 2>/dev/null \
+            | awk '/read:/{for(i=1;i<=NF;i++){if($i~/^IOPS=/){gsub("IOPS=|,","",$i);print "PROBE|randread_iops|"$i} if($i~/^BW=/){gsub("BW=","",$i);print "PROBE|randread_bw|"$i}}}'
+
+      - name: Disk — randwrite 4k qd32 (direct)
+        run: |
+          fio --name=rw --rw=randwrite --bs=4k --iodepth=32 --size=1G \
+              --runtime=15 --time_based --filename=./.fio/rw \
+              --direct=1 --group_reporting 2>/dev/null \
+            | awk '/write:/{for(i=1;i<=NF;i++){if($i~/^IOPS=/){gsub("IOPS=|,","",$i);print "PROBE|randwrite_iops|"$i} if($i~/^BW=/){gsub("BW=","",$i);print "PROBE|randwrite_bw|"$i}}}'
+
+      - name: Disk — sequential read 1m qd8 (direct)
+        run: |
+          fio --name=sr --rw=read --bs=1m --iodepth=8 --size=2G \
+              --runtime=15 --time_based --filename=./.fio/sr \
+              --direct=1 --group_reporting 2>/dev/null \
+            | awk '/read:/{for(i=1;i<=NF;i++){if($i~/^BW=/){gsub("BW=","",$i);print "PROBE|seqread_bw|"$i}}}'
+          rm -rf ./.fio
+
+      - name: Disk — small-file storm (tsc-like, 20k files)
+        run: |
+          set +e
+          rm -rf /tmp/sf
+          s=$(date +%s%N)
+          python3 -c "import os; os.makedirs('/tmp/sf', exist_ok=True); buf='x'*2048; [open('/tmp/sf/f%d.js'%i,'w').write(buf) for i in range(20000)]"
+          sync
+          echo "PROBE|smallfile_write_ms|$(( ($(date +%s%N) - s) / 1000000 ))"
+
+          # 冷读:丢掉 page cache 才能测到真实盘速
+          sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || echo "PROBE|drop_caches|denied"
+          s=$(date +%s%N)
+          tar cf - -C /tmp sf > /dev/null
+          echo "PROBE|smallfile_read_cold_ms|$(( ($(date +%s%N) - s) / 1000000 ))"
+
+          s=$(date +%s%N)
+          tar cf - -C /tmp sf > /dev/null
+          echo "PROBE|smallfile_read_warm_ms|$(( ($(date +%s%N) - s) / 1000000 ))"
+
+          s=$(date +%s%N)
+          rm -rf /tmp/sf
+          sync
+          echo "PROBE|smallfile_delete_ms|$(( ($(date +%s%N) - s) / 1000000 ))"
+
+      - name: Summary
+        if: always()
+        run: echo "PROBE|done|${RUNNER_NAME}|$(date -u +%H:%M:%S)"

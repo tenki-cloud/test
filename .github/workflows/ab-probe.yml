@@ -1,0 +1,155 @@
+name: A/B — tenki 8c16g vs blacksmith 8vcpu
+
+# 同一个 commit、同一份负载,两种 runner 各跑 10 次,用来把方差压下去。
+#
+# 背景:客户 08-27 19:20-19:50 在两边各跑了一遍真实 CI,同 commit 对照下
+# tenki 平均只慢 5.7%(16 个 job,6 个反超),但每个 job 只有 1-2 个样本,
+# 方差 -47% 到 +58%,均值不可信。这个探针补样本量。
+#
+# 负载复刻客户 integration-test 的结构(该 job 在 blacksmith 上 330 个样本的
+# step 均值):Initialize containers 8.4s / Checkout 7.5s / Install deps 4.0s /
+# Install pgpm CLI 9.1s / Build 109.1s / Run proxy e2e 35.7s。
+# 其中 Build 占 60%,是 TypeScript 编译 —— 下面用固定规模的合成 TS 工程复刻,
+# 不依赖客户私有仓库,两边完全一致。
+#
+# 每行结果以 AB| 开头,字段:AB|<runner>|<rep>|<metric>|<value>
+
+on:
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: 每种 runner 重复次数(改这里要同步改下面的 matrix)
+        default: '10'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  TS_VERSION: '5.6.3'
+  MODULES: '600'
+
+jobs:
+  ab:
+    name: ${{ matrix.runner }} #${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        runner:
+          - tenki-standard-large-8c-16g
+          - blacksmith-8vcpu-ubuntu-2404
+        rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+
+    services:
+      pg_db:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    env:
+      R: ${{ matrix.runner }}
+      N: ${{ matrix.rep }}
+      PGHOST: localhost
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGPASSWORD: password
+
+    steps:
+      - name: Identity
+        run: |
+          set +e
+          echo "AB|$R|$N|runner_name|${RUNNER_NAME}"
+          echo "AB|$R|$N|nproc|$(nproc)"
+          echo "AB|$R|$N|mem_gb|$(free -g | awk '/^Mem:/{print $2}')"
+          echo "AB|$R|$N|cpu|$(lscpu | awk -F: '/^Model name/{gsub(/^ +/,"",$2); print $2}')"
+          echo "AB|$R|$N|start_utc|$(date -u +%H:%M:%S)"
+
+      - name: Checkout
+        run: |
+          s=$(date +%s%N)
+          git clone --depth 1 --filter=blob:none https://github.com/${{ github.repository }} /tmp/repo 2>/dev/null
+          echo "AB|$R|$N|checkout_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install toolchain
+        run: |
+          s=$(date +%s%N)
+          npm install -g --no-audit --no-fund typescript@${TS_VERSION} >/dev/null 2>&1
+          echo "AB|$R|$N|toolchain_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+
+      # 复刻 Build:600 个互相 import 的模块,tsc 全量编译并落盘。
+      # CPU(类型检查)+ 小文件 I/O(读源码、写 .js/.d.ts/.map),
+      # 和客户那个 109s 的 Build 是同一类工作。
+      - name: Generate TS project
+        run: |
+          s=$(date +%s%N)
+          mkdir -p /tmp/proj/src
+          node -e 'const fs=require("fs"),n=+process.env.MODULES;for(let i=0;i<n;i++){const dep=i>0?`import { v${i-1} } from "./m${i-1}";`:"";fs.writeFileSync(`/tmp/proj/src/m${i}.ts`,`${dep}\nexport const v${i}: number = ${i};\nexport interface I${i} { a: number; b: string; c: number[]; d: Record<string,number> }\nexport function f${i}(x: I${i}): number { return x.a + x.c.length + Object.keys(x.d).length${i>0?" + v"+(i-1):""}; }\nexport type T${i}<X> = { wrapped: X; tag: "m${i}"; list: I${i}[] };\n`)}'
+          printf '{"compilerOptions":{"target":"ES2022","module":"commonjs","declaration":true,"sourceMap":true,"strict":true,"outDir":"dist","rootDir":"src"},"include":["src"]}' > /tmp/proj/tsconfig.json
+          echo "AB|$R|$N|gen_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+
+      - name: Build (tsc)
+        run: |
+          cd /tmp/proj
+          s=$(date +%s%N)
+          tsc -p tsconfig.json
+          echo "AB|$R|$N|build_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+          echo "AB|$R|$N|build_outputs|$(find dist -type f | wc -l)"
+
+      - name: Build again (incremental-cold)
+        run: |
+          cd /tmp/proj
+          rm -rf dist
+          s=$(date +%s%N)
+          tsc -p tsconfig.json
+          echo "AB|$R|$N|build2_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+
+      # 复刻测试里的 DB 部分:建表 + 批量插入 + 查询,走 service container。
+      - name: Postgres workload
+        run: |
+          s=$(date +%s%N)
+          psql -q -c "SELECT 1" >/dev/null
+          echo "AB|$R|$N|pg_connect_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+          s=$(date +%s%N)
+          psql -q -v ON_ERROR_STOP=1 \
+            -c "CREATE TABLE t (id serial primary key, a int, b text, c jsonb)" \
+            -c "INSERT INTO t (a,b,c) SELECT g, md5(g::text), jsonb_build_object('k',g) FROM generate_series(1,200000) g" \
+            -c "CREATE INDEX ON t (a)" \
+            -c "CREATE INDEX ON t USING gin (c)" \
+            -c "ANALYZE t" >/dev/null
+          echo "AB|$R|$N|pg_write_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+          s=$(date +%s%N)
+          psql -q -c "SELECT count(*) FROM t WHERE a % 7 = 0" >/dev/null
+          psql -q -c "SELECT count(*) FROM t WHERE c @> '{\"k\":42}'" >/dev/null
+          echo "AB|$R|$N|pg_read_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+
+      - name: Small-file storm
+        run: |
+          s=$(date +%s%N)
+          node -e 'const fs=require("fs");fs.mkdirSync("/tmp/sf",{recursive:true});const b="x".repeat(2048);for(let i=0;i<20000;i++)fs.writeFileSync(`/tmp/sf/f${i}.js`,b)'
+          sync
+          echo "AB|$R|$N|sf_write_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+          s=$(date +%s%N)
+          tar cf - -C /tmp sf > /dev/null
+          echo "AB|$R|$N|sf_read_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+          s=$(date +%s%N)
+          rm -rf /tmp/sf; sync
+          echo "AB|$R|$N|sf_del_ms|$(( ($(date +%s%N)-s)/1000000 ))"
+
+      - name: Done
+        if: always()
+        run: echo "AB|$R|$N|end_utc|$(date -u +%H:%M:%S)"

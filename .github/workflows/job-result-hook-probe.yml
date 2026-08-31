@@ -1,0 +1,69 @@
+name: Probe job-completed hook result
+
+# Answers one question: does the runner tell the job-completed hook whether the
+# job passed? Our hook writes `job_result` from ${GITHUB_JOB_RESULT}, which is
+# not a documented GitHub variable — if the runner never sets it, that field is
+# permanently "unknown" and a metric built on it would be worthless.
+#
+# The hook is a file we own at $ACTIONS_RUNNER_HOOK_JOB_COMPLETED, owned by the
+# job's own uid, so a step can wrap it: echo the candidate variables, run the
+# real hook, then print the JSON it produced. Report-only, one job per outcome,
+# because a variable that only appears on failure is the interesting case.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: "Runner pool to probe"
+        required: false
+        default: "tenki-standard-autoscale"
+        type: string
+
+jobs:
+  passing-job:
+    runs-on: ${{ inputs.runner_label || 'tenki-standard-autoscale' }}
+    steps:
+      - name: Wrap the job-completed hook
+        run: |
+          HOOK="${ACTIONS_RUNNER_HOOK_JOB_COMPLETED:-$HOME/actions-runner/complete-hook.sh}"
+          echo "hook path = $HOOK"
+          ls -l "$HOOK" || { echo "::warning::no completed hook on this runner"; exit 0; }
+          cp "$HOOK" "$HOOK.orig"
+          cat > "$HOOK" <<'WRAPPER'
+          #!/bin/bash
+          echo "PROBE job_result_var=[${GITHUB_JOB_RESULT:-<unset>}]"
+          echo "PROBE job_status_var=[${GITHUB_JOB_STATUS:-<unset>}]"
+          env | grep -iE 'result|status|conclusion|outcome' | sed 's/^/PROBE env /' || true
+          bash "$0.orig"
+          echo "PROBE completion_json_begin"
+          cat /tmp/job_completion_info.json 2>/dev/null || echo "PROBE no completion json"
+          echo "PROBE completion_json_end"
+          WRAPPER
+          chmod 0755 "$HOOK"
+
+      - name: Succeed
+        run: echo "this job passes"
+
+  failing-job:
+    runs-on: ${{ inputs.runner_label || 'tenki-standard-autoscale' }}
+    steps:
+      - name: Wrap the job-completed hook
+        run: |
+          HOOK="${ACTIONS_RUNNER_HOOK_JOB_COMPLETED:-$HOME/actions-runner/complete-hook.sh}"
+          echo "hook path = $HOOK"
+          ls -l "$HOOK" || { echo "::warning::no completed hook on this runner"; exit 0; }
+          cp "$HOOK" "$HOOK.orig"
+          cat > "$HOOK" <<'WRAPPER'
+          #!/bin/bash
+          echo "PROBE job_result_var=[${GITHUB_JOB_RESULT:-<unset>}]"
+          echo "PROBE job_status_var=[${GITHUB_JOB_STATUS:-<unset>}]"
+          env | grep -iE 'result|status|conclusion|outcome' | sed 's/^/PROBE env /' || true
+          bash "$0.orig"
+          echo "PROBE completion_json_begin"
+          cat /tmp/job_completion_info.json 2>/dev/null || echo "PROBE no completion json"
+          echo "PROBE completion_json_end"
+          WRAPPER
+          chmod 0755 "$HOOK"
+
+      - name: Fail on purpose
+        run: exit 1

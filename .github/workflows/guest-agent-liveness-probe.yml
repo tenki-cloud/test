@@ -128,12 +128,17 @@ jobs:
           done
           SAMPLER
           cat > /tmp/probe/hog.py <<'HOG'
-          import sys, time
+          import time
           total = int(next(l.split()[1] for l in open('/proc/meminfo') if l.startswith('MemTotal')))
-          target = int(total * 0.92) * 1024
-          chunk, held = 64 << 20, []
+          # Hold most of RAM, then keep allocating against what is left. Holding
+          # alone reaches a steady state that kswapd keeps up with: the previous
+          # round hit MemAvailable 350MB with pgscan_kswapd 328k and allocstall
+          # still 0. The customer's guest had allocstall 81554 and pgscan_direct
+          # 21.2M, which only happens when an allocation cannot be served from
+          # the free list and has to reclaim in its own context.
+          base, chunk, held = int(total * 0.80) * 1024, 64 << 20, []
           try:
-              while sum(len(b) for b in held) < target:
+              while sum(len(b) for b in held) < base:
                   b = bytearray(chunk)
                   for off in range(0, chunk, 4096):
                       b[off] = 1
@@ -141,12 +146,21 @@ jobs:
           except MemoryError:
               pass
           print("held_mb=%d" % (sum(len(b) for b in held) >> 20), flush=True)
-          # Keep every page referenced so reclaim finds it hot and has to keep scanning.
+          churn = 0
           while True:
-              for b in held:
-                  for off in range(0, len(b), 4096):
-                      b[off] = (b[off] + 1) & 0xFF
-              time.sleep(0.05)
+              try:
+                  t = bytearray(256 << 20)
+                  for off in range(0, len(t), 4096):
+                      t[off] = 1
+                  del t
+                  churn += 1
+              except MemoryError:
+                  churn += 1
+              if churn % 20 == 0:
+                  print("churn=%d" % churn, flush=True)
+              # Keep the held set hot so it cannot be cheaply evicted either.
+              for b in held[::8]:
+                  b[0] = (b[0] + 1) & 0xFF
           HOG
 
           chmod +x /tmp/probe/sample.sh

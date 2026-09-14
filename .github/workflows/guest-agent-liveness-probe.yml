@@ -46,7 +46,7 @@ on:
       profiles:
         description: 'JSON array of profiles to run, e.g. ["iostall"]'
         required: false
-        default: '["idle","iostall","memreclaim","jobshaped"]'
+        default: '["idle","memavalanche"]'
         type: string
 
 jobs:
@@ -65,7 +65,7 @@ jobs:
         # the shape is the platform's alone and no workload triggers it. CPU
         # saturation is already a settled negative (loadavg 18.2 on 8 vCPU for 18
         # minutes, zero liveness failures), so what remains to test is I/O.
-        profile: ${{ fromJSON(inputs.profiles || '["idle","iostall","memreclaim","jobshaped"]') }}
+        profile: ${{ fromJSON(inputs.profiles || '["idle","memavalanche"]') }}
     steps:
       - name: Install the sampler
         run: |
@@ -128,39 +128,51 @@ jobs:
           done
           SAMPLER
           cat > /tmp/probe/hog.py <<'HOG'
-          import time
+          import sys, time
+          # Two modes, because the shape matters more than the amount.
+          #
+          #   hold  <fraction>  anonymous baseline, kept referenced
+          #   spike <mb>        allocate, touch every page, free, repeat, no sleep
+          #
+          # Six earlier rounds raised memory gradually and held it. That reaches a
+          # steady state kswapd keeps up with: MemAvailable 350MB with
+          # pgscan_kswapd 328k and allocstall still 0. Direct reclaim only happens
+          # when an allocation cannot be served from the free list, and a single
+          # allocator's stalls serialise. The customer's guest had ~10 jest
+          # workers, postgres and a createdb per test case all allocating at once,
+          # and collapsed 9.5GB -> 586MB inside one 30s sample.
+          mode = sys.argv[1]
           total = int(next(l.split()[1] for l in open('/proc/meminfo') if l.startswith('MemTotal')))
-          # Hold most of RAM, then keep allocating against what is left. Holding
-          # alone reaches a steady state that kswapd keeps up with: the previous
-          # round hit MemAvailable 350MB with pgscan_kswapd 328k and allocstall
-          # still 0. The customer's guest had allocstall 81554 and pgscan_direct
-          # 21.2M, which only happens when an allocation cannot be served from
-          # the free list and has to reclaim in its own context.
-          base, chunk, held = int(total * 0.80) * 1024, 64 << 20, []
-          try:
-              while sum(len(b) for b in held) < base:
-                  b = bytearray(chunk)
-                  for off in range(0, chunk, 4096):
-                      b[off] = 1
-                  held.append(b)
-          except MemoryError:
-              pass
-          print("held_mb=%d" % (sum(len(b) for b in held) >> 20), flush=True)
-          churn = 0
-          while True:
+
+          if mode == 'hold':
+              target, chunk, held = int(total * float(sys.argv[2])) * 1024, 64 << 20, []
               try:
-                  t = bytearray(256 << 20)
-                  for off in range(0, len(t), 4096):
-                      t[off] = 1
-                  del t
-                  churn += 1
+                  while sum(len(b) for b in held) < target:
+                      b = bytearray(chunk)
+                      for off in range(0, chunk, 4096):
+                          b[off] = 1
+                      held.append(b)
               except MemoryError:
-                  churn += 1
-              if churn % 20 == 0:
-                  print("churn=%d" % churn, flush=True)
-              # Keep the held set hot so it cannot be cheaply evicted either.
-              for b in held[::8]:
-                  b[0] = (b[0] + 1) & 0xFF
+                  pass
+              print("hold_mb=%d" % (sum(len(b) for b in held) >> 20), flush=True)
+              while True:
+                  for b in held[::16]:
+                      b[0] = (b[0] + 1) & 0xFF
+                  time.sleep(0.2)
+
+          if mode == 'spike':
+              size, n = int(sys.argv[2]) << 20, 0
+              while True:
+                  try:
+                      t = bytearray(size)
+                      for off in range(0, size, 4096):
+                          t[off] = 1
+                      del t
+                  except MemoryError:
+                      pass
+                  n += 1
+                  if n % 25 == 0:
+                      print("spike_%s=%d" % (sys.argv[3], n), flush=True)
           HOG
 
           chmod +x /tmp/probe/sample.sh
@@ -217,22 +229,22 @@ jobs:
               rm -f /tmp/probe/io.* /tmp/probe/j* 2>/dev/null
               ;;
 
-            memreclaim)
-              # Target state, taken from the second of the customer's two reaps
-              # (session 01a092e9): MemAvailable 220MB of 17GB, allocstall 81554,
-              # pgscan_direct 21.2M. Its VM was thrashing, not merely full.
-              #
-              # Two earlier attempts never got near it. Page cache is reclaimable
-              # and cost the kernel nothing (allocstall stayed 0), and /dev/shm
-              # defaults to half of RAM so a dd sized above that just hits ENOSPC.
-              # This holds anonymous memory and keeps re-touching it instead.
-              python3 /tmp/probe/hog.py &
-              HOG_PID=$!
-              while [ "$(date +%s)" -lt "$END" ]; do
-                kill -0 "$HOG_PID" 2>/dev/null || echo "hog_died=yes t=$(date -u +%H:%M:%S)"
-                sleep 5
+            memavalanche)
+              # The customer's shape: a baseline near the ceiling, then several
+              # processes allocating hard *at the same time*. One allocator never
+              # produced direct reclaim in six rounds; concurrency is the variable
+              # that was missing.
+              echo "swap_total_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
+              python3 /tmp/probe/hog.py hold 0.55 &
+              sleep 45
+              N=$(nproc)
+              i=1
+              while [ "$i" -le "$N" ]; do
+                python3 /tmp/probe/hog.py spike 1024 "$i" &
+                i=$((i + 1))
               done
-              kill -9 "$HOG_PID" 2>/dev/null
+              while [ "$(date +%s)" -lt "$END" ]; do sleep 5; done
+              pkill -f /tmp/probe/hog.py 2>/dev/null
               ;;
 
             jobshaped)

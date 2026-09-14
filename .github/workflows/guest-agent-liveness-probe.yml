@@ -51,8 +51,10 @@ jobs:
       fail-fast: false
       matrix:
         # idle is the control: if the guest goes silent with nothing running,
-        # shape (b) is the platform's alone and no workload triggers it.
-        profile: [idle, memory, procchurn, jobshaped]
+        # shape (b) is the platform's alone and no workload triggers it. The first
+        # round cleared all four profiles, but none of them saturated the CPU and
+        # the memory one never forced reclaim, so none tested the mechanism.
+        profile: [idle, cpusat, memreclaim, jobshaped]
     steps:
       - name: Install the sampler
         run: |
@@ -70,7 +72,8 @@ jobs:
             for p in /proc/[0-9]*; do
               exe=$(readlink "$p/exe" 2>/dev/null) || continue
               case "$exe" in
-                *guest-agent*|*guestagent*|*tenki-guest*|*vm-agent*) basename "$p"; return ;;
+                /usr/local/bin/sandbox|*guest-agent*|*guestagent*|*tenki-guest*|*vm-agent*)
+                  basename "$p"; return ;;
               esac
             done
             echo ""
@@ -100,9 +103,10 @@ jobs:
             # carries every process's full exe path, so the newest of these file
             # names is readable from the host even when this job's stdout never
             # reaches GitHub.
+            [ -n "${MARKER_PID:-}" ] && kill "$MARKER_PID" 2>/dev/null
             rm -f /tmp/TENKI-LIVEPROBE-* 2>/dev/null
-            cp /bin/sleep "/tmp/TENKI-LIVEPROBE-t${TICK}-agent${AST}-fds${AFD}-free${ARSS}" 2>/dev/null \
-              && "/tmp/TENKI-LIVEPROBE-t${TICK}-agent${AST}-fds${AFD}-free${ARSS}" 1800 &
+            M="/tmp/TENKI-LIVEPROBE-t${TICK}-agent${AST}-fds${AFD}-rss${ARSS}"
+            if cp /bin/sleep "$M" 2>/dev/null; then "$M" 1800 & MARKER_PID=$!; fi
             sleep 5
           done
           SAMPLER
@@ -122,49 +126,49 @@ jobs:
 
           case "${{ matrix.profile }}" in
             idle)
-              # Nothing but the sampler.
               while [ "$(date +%s)" -lt "$END" ]; do sleep 10; done
               ;;
 
-            memory)
-              # Drive reclaim without inviting the OOM killer: fill page cache
-              # with file I/O the kernel must keep scanning. This is the shape
-              # the customer's VM was in (MemFree ~200MB, kswapd scanning) —
-              # not an allocation spike.
-              MEMKB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
-              SZ=$(( MEMKB / 1024 * 80 / 100 ))
-              mkdir -p /tmp/probe/fill
-              while [ "$(date +%s)" -lt "$END" ]; do
-                dd if=/dev/zero of=/tmp/probe/fill/blob bs=1M count="$SZ" conv=fsync 2>/dev/null
-                cat /tmp/probe/fill/blob > /dev/null 2>&1
-                rm -f /tmp/probe/fill/blob
+            cpusat)
+              # Saturate every core twice over. This is the condition the
+              # guest-agent's cpu.weight was meant to survive and, because the
+              # runner unit is outside its cgroup, the one it has no protection
+              # against.
+              N=$(( $(nproc) * 2 ))
+              i=0
+              while [ "$i" -lt "$N" ]; do
+                ( while :; do :; done ) & i=$((i + 1))
               done
+              while [ "$(date +%s)" -lt "$END" ]; do sleep 5; done
+              kill %1 2>/dev/null; pkill -P $$ 2>/dev/null
               ;;
 
-            procchurn)
-              # Thousands of short-lived processes and open fds. If the guest-agent
-              # leaks or starves on accept()/fd budget, this is what surfaces it.
-              while [ "$(date +%s)" -lt "$END" ]; do
-                for _ in $(seq 1 200); do (true) & done
-                wait
-                for _ in $(seq 1 50); do (exec 9<>/dev/null; sleep 1) & done
-                wait
-              done
+            memreclaim)
+              # Anonymous, resident memory - page cache is reclaimable and cost
+              # the kernel nothing last round (allocstall stayed 0). Held just
+              # under MemTotal so the kernel is forced to scan rather than OOM.
+              MEMKB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+              HOLD=$(( MEMKB * 85 / 100 / 1024 ))
+              mkdir -p /dev/shm/probe
+              ( dd if=/dev/zero of=/dev/shm/probe/anon bs=1M count="$HOLD" 2>/dev/null; sleep 100000 ) &
+              while [ "$(date +%s)" -lt "$END" ]; do sleep 5; done
+              rm -rf /dev/shm/probe
               ;;
 
             jobshaped)
-              # The customer's failing job in miniature: a Postgres service
-              # container, a parallel Node workload and repeated docker churn.
-              docker run -d --name probe-pg -e POSTGRES_PASSWORD=probe -p 5432:5432 postgres:18 >/dev/null 2>&1
-              echo "pg_started=$([ $? -eq 0 ] && echo yes || echo no)"
+              # The customer's job in miniature, sized to the runner: a Postgres
+              # service container plus one Node worker per core, each allocating
+              # and churning, restarted in short bounded rounds so the deadline
+              # is honoured.
+              docker run -d --name probe-pg -e POSTGRES_PASSWORD=probe postgres:18 >/dev/null 2>&1
+              echo "pg_started=$?"
               while [ "$(date +%s)" -lt "$END" ]; do
-                if command -v node >/dev/null 2>&1; then
-                  for _ in $(seq 1 "$(nproc)"); do
-                    node -e 'const a=[];for(let i=0;i<3e6;i++)a.push({i,s:"x".repeat(24)});process.exit(0)' >/dev/null 2>&1 &
-                  done
-                  wait
-                fi
-                docker run --rm postgres:18 psql --version >/dev/null 2>&1
+                i=0
+                while [ "$i" -lt "$(nproc)" ]; do
+                  timeout 60 node -e 'const t=Date.now();while(Date.now()-t<55000){const a=[];for(let i=0;i<4e5;i++)a.push({i,s:"x".repeat(64)});}' >/dev/null 2>&1 &
+                  i=$((i + 1))
+                done
+                wait
               done
               docker rm -f probe-pg >/dev/null 2>&1
               ;;

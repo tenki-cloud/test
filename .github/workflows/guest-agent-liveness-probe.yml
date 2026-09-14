@@ -1,0 +1,183 @@
+name: Probe what the guest is doing when node-agent reaps it
+
+# Why this exists
+#
+# Runner jobs on the sandbox path die with `runner job: failed
+# reason=guest_disconnected`. That verdict is downstream noise: the host log
+# shows node-agent's own liveness reaper firing first —
+#
+#   sandbox guest-agent liveness failure started  failure_stage=response_read reason=timeout
+#   ... 12 consecutive failures, grace 2m0s ...
+#   sandbox session terminal forensics  cause=guest_agent_liveness
+#   reaping dead sandbox session
+#
+# — i.e. the guest stopped answering the vsock liveness ping for two minutes and
+# node-agent killed the VM with the customer's job still running. In every
+# sample so far cloud-hypervisor itself is `State: S (sleeping)`, the vsock
+# socket is still present and the console is silent, so the VM is fine and the
+# guest-agent alone is unresponsive.
+#
+# Two sub-shapes appear in the forensics, and they want different fixes:
+#   a) evidence=guest_memory_pressure_without_observed_oom — allocstall in the
+#      millions, MemFree near zero. The guest is thrashing in reclaim.
+#   b) evidence=guest_resources_not_pressured_at_last_sample — gigabytes free,
+#      vmstat empty, failure_stage=handshake_read. Nothing explains it yet.
+#
+# node-agent can only sample the guest through the very channel that is failing,
+# so its forensics stop exactly when the answer would get interesting. This probe
+# takes the same measurements from inside, on a timer the vsock cannot block.
+#
+# Report-only: never fails the job. Prints counters and classifications only —
+# this repository and its logs are public.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: "Runner pool to probe"
+        required: false
+        default: "tenki-standard-autoscale"
+        type: string
+      minutes:
+        description: "How long each profile runs"
+        required: false
+        default: "18"
+        type: string
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner_label || 'tenki-standard-autoscale' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # idle is the control: if the guest goes silent with nothing running,
+        # shape (b) is the platform's alone and no workload triggers it.
+        profile: [idle, memory, procchurn, jobshaped]
+    steps:
+      - name: Install the sampler
+        run: |
+          set +e
+          mkdir -p /tmp/probe
+          cat > /tmp/probe/sample.sh <<'SAMPLER'
+          #!/bin/sh
+          # One line per tick, same counters node-agent puts in its terminal
+          # forensics, so a reap can be lined up against the guest's own view.
+          vmstat_val() { awk -v k="$1" '$1==k {print $2; found=1} END{if(!found) print "na"}' /proc/vmstat; }
+          mem_val()    { awk -v k="$1" '$1==k":" {print $2; found=1} END{if(!found) print "na"}' /proc/meminfo; }
+
+          # The guest-agent is the process whose liveness node-agent is judging.
+          agent_pid() {
+            for p in /proc/[0-9]*; do
+              exe=$(readlink "$p/exe" 2>/dev/null) || continue
+              case "$exe" in
+                *guest-agent*|*guestagent*|*tenki-guest*|*vm-agent*) basename "$p"; return ;;
+              esac
+            done
+            echo ""
+          }
+
+          AP=$(agent_pid)
+          TICK=0
+          while :; do
+            TICK=$((TICK + 1))
+            if [ -z "$AP" ] || [ ! -d "/proc/$AP" ]; then AP=$(agent_pid); fi
+            if [ -n "$AP" ] && [ -d "/proc/$AP" ]; then
+              AST=$(awk '/^State:/{print $2}' "/proc/$AP/status" 2>/dev/null)
+              ATH=$(awk '/^Threads:/{print $2}' "/proc/$AP/status" 2>/dev/null)
+              ARSS=$(awk '/^VmRSS:/{print $2}' "/proc/$AP/status" 2>/dev/null)
+              AFD=$(ls "/proc/$AP/fd" 2>/dev/null | wc -l)
+            else
+              AST=gone; ATH=na; ARSS=na; AFD=na
+            fi
+            printf 'tick=%s t=%s agent_pid=%s agent_state=%s agent_threads=%s agent_rss_kb=%s agent_fds=%s procs=%s loadavg=%s memfree_kb=%s memavail_kb=%s allocstall_normal=%s pgscan_kswapd=%s pgscan_direct=%s\n' \
+              "$TICK" "$(date -u +%H:%M:%S)" "${AP:-none}" "$AST" "$ATH" "$ARSS" "$AFD" \
+              "$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)" \
+              "$(cut -d' ' -f1-3 /proc/loadavg)" \
+              "$(mem_val MemFree)" "$(mem_val MemAvailable)" \
+              "$(vmstat_val allocstall_normal)" "$(vmstat_val pgscan_kswapd)" "$(vmstat_val pgscan_direct)"
+
+            # Survives the VM being reaped: node-agent's `guest process snapshot`
+            # carries every process's full exe path, so the newest of these file
+            # names is readable from the host even when this job's stdout never
+            # reaches GitHub.
+            rm -f /tmp/TENKI-LIVEPROBE-* 2>/dev/null
+            cp /bin/sleep "/tmp/TENKI-LIVEPROBE-t${TICK}-agent${AST}-fds${AFD}-free${ARSS}" 2>/dev/null \
+              && "/tmp/TENKI-LIVEPROBE-t${TICK}-agent${AST}-fds${AFD}-free${ARSS}" 1800 &
+            sleep 5
+          done
+          SAMPLER
+          chmod +x /tmp/probe/sample.sh
+          echo "sampler_installed=yes"
+          echo "profile=${{ matrix.profile }}"
+          echo "mem_total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+          echo "nproc=$(nproc)"
+
+      - name: Run profile under the sampler
+        run: |
+          set +e
+          MINUTES="${{ inputs.minutes || '18' }}"
+          /tmp/probe/sample.sh &
+          SAMPLER_PID=$!
+          END=$(( $(date +%s) + MINUTES * 60 ))
+
+          case "${{ matrix.profile }}" in
+            idle)
+              # Nothing but the sampler.
+              while [ "$(date +%s)" -lt "$END" ]; do sleep 10; done
+              ;;
+
+            memory)
+              # Drive reclaim without inviting the OOM killer: fill page cache
+              # with file I/O the kernel must keep scanning. This is the shape
+              # the customer's VM was in (MemFree ~200MB, kswapd scanning) —
+              # not an allocation spike.
+              MEMKB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+              SZ=$(( MEMKB / 1024 * 80 / 100 ))
+              mkdir -p /tmp/probe/fill
+              while [ "$(date +%s)" -lt "$END" ]; do
+                dd if=/dev/zero of=/tmp/probe/fill/blob bs=1M count="$SZ" conv=fsync 2>/dev/null
+                cat /tmp/probe/fill/blob > /dev/null 2>&1
+                rm -f /tmp/probe/fill/blob
+              done
+              ;;
+
+            procchurn)
+              # Thousands of short-lived processes and open fds. If the guest-agent
+              # leaks or starves on accept()/fd budget, this is what surfaces it.
+              while [ "$(date +%s)" -lt "$END" ]; do
+                for _ in $(seq 1 200); do (true) & done
+                wait
+                for _ in $(seq 1 50); do (exec 9<>/dev/null; sleep 1) & done
+                wait
+              done
+              ;;
+
+            jobshaped)
+              # The customer's failing job in miniature: a Postgres service
+              # container, a parallel Node workload and repeated docker churn.
+              docker run -d --name probe-pg -e POSTGRES_PASSWORD=probe -p 5432:5432 postgres:18 >/dev/null 2>&1
+              echo "pg_started=$([ $? -eq 0 ] && echo yes || echo no)"
+              while [ "$(date +%s)" -lt "$END" ]; do
+                if command -v node >/dev/null 2>&1; then
+                  for _ in $(seq 1 "$(nproc)"); do
+                    node -e 'const a=[];for(let i=0;i<3e6;i++)a.push({i,s:"x".repeat(24)});process.exit(0)' >/dev/null 2>&1 &
+                  done
+                  wait
+                fi
+                docker run --rm postgres:18 psql --version >/dev/null 2>&1
+              done
+              docker rm -f probe-pg >/dev/null 2>&1
+              ;;
+          esac
+
+          kill "$SAMPLER_PID" 2>/dev/null
+          echo "profile_completed=yes"
+
+      - name: Verdict
+        if: always()
+        run: |
+          set +e
+          echo "profile=${{ matrix.profile }}"
+          echo "job_reached_final_step=yes"
+          echo "surviving_probe_markers=$(ls /tmp/TENKI-LIVEPROBE-* 2>/dev/null | wc -l)"
+          ls /tmp/TENKI-LIVEPROBE-* 2>/dev/null | tail -1

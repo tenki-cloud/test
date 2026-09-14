@@ -1,0 +1,142 @@
+name: Probe guest resolution of the .localhost TLD
+
+# Why this exists
+#
+# constructive-io/constructive-db's `Feature mantra` job runs a Playwright suite
+# that talks to http://site-a.localhost:<port>. On the legacy VM path it passed
+# 6/6; on the sandbox path it fails with `getaddrinfo ENOTFOUND site-a.localhost`
+# 3 times out of 5. Nothing in the customer's workflow changed between the two.
+#
+# `*.localhost` has no entry in /etc/hosts and no authoritative DNS server. It
+# resolves only because systemd-resolved synthesizes it (RFC 6761) and glibc
+# reaches resolved through the `resolve` module in /etc/nsswitch.conf. The
+# sandbox restore path (backend/pkg/sandboxguestnet/configure.go) SIGKILLs
+# systemd-networkd and, when /etc/resolv.conf is a symlink to resolved's stub,
+# deletes it and writes `nameserver $DNS` — $DNS defaults to 1.1.1.1, which
+# answers NXDOMAIN for anything under .localhost.
+#
+# So this probe answers three things:
+#   1. which of the two resolution paths the guest actually has
+#   2. whether .localhost resolves at job start
+#   3. whether it stops resolving part-way through a job (the 3-of-5 shape)
+#
+# Report-only: never fails the job. Prints classifications, not addresses —
+# this repository and its logs are public.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: "Runner pool to probe"
+        required: false
+        default: "tenki-standard-autoscale"
+        type: string
+      watch_minutes:
+        description: "How long to keep re-checking for drift"
+        required: false
+        default: "12"
+        type: string
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner_label || 'tenki-standard-autoscale' }}
+    steps:
+      - name: Resolution path the guest has
+        run: |
+          set +e
+
+          if [ -L /etc/resolv.conf ]; then
+            echo "resolv_conf_kind=symlink"
+          elif [ -f /etc/resolv.conf ]; then
+            echo "resolv_conf_kind=regular_file"
+          else
+            echo "resolv_conf_kind=absent"
+          fi
+
+          # 127.0.0.53 is systemd-resolved's stub. Anything else means the
+          # restore path replaced the file and lookups now leave the host.
+          if grep -Eq '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53([[:space:]]|$)' /etc/resolv.conf 2>/dev/null; then
+            echo "first_resolver=resolved_stub"
+          elif grep -Eq '^[[:space:]]*nameserver[[:space:]]+127\.' /etc/resolv.conf 2>/dev/null; then
+            echo "first_resolver=other_loopback"
+          elif grep -q '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null; then
+            echo "first_resolver=off_host"
+          else
+            echo "first_resolver=none"
+          fi
+          echo "resolv_conf_nameserver_count=$(grep -c '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null || echo 0)"
+
+          # nsswitch is a stock config file, safe to print verbatim. `resolve`
+          # is what carries a .localhost lookup to systemd-resolved; without it
+          # the synthesis never happens no matter what resolv.conf says.
+          HOSTS_LINE=$(grep -E '^hosts:' /etc/nsswitch.conf 2>/dev/null)
+          echo "nsswitch_hosts=${HOSTS_LINE:-<absent>}"
+          echo "nsswitch_has_resolve=$(printf '%s' "$HOSTS_LINE" | grep -qw resolve && echo yes || echo no)"
+          echo "nsswitch_has_myhostname=$(printf '%s' "$HOSTS_LINE" | grep -qw myhostname && echo yes || echo no)"
+
+          for u in systemd-resolved systemd-networkd; do
+            echo "${u}_active=$(systemctl is-active "$u" 2>/dev/null || echo unknown)"
+          done
+          echo "resolvectl_answers=$(resolvectl status >/dev/null 2>&1 && echo yes || echo no)"
+
+          echo "hosts_file_localhost_entries=$(grep -cE '[[:space:]]\S*\.localhost([[:space:]]|$)' /etc/hosts 2>/dev/null || echo 0)"
+
+      - name: Does .localhost resolve right now
+        run: |
+          set +e
+          # getent is glibc's NSS path — the same one Node's dns.lookup and
+          # Playwright's request context end up on.
+          probe_getent() {
+            if timeout 5 getent ahostsv4 "$1" >/dev/null 2>&1; then echo resolved; else echo ENOTFOUND; fi
+          }
+          for n in localhost site-a.localhost app.localhost deep.sub.localhost example.com; do
+            echo "getent_${n}=$(probe_getent "$n")"
+          done
+
+          # Node is the caller that actually failed for the customer, and it does
+          # not always take the same path as getent (c-ares vs getaddrinfo).
+          if command -v node >/dev/null 2>&1; then
+            echo "node_version_present=yes"
+            node -e '
+              const dns = require("dns");
+              const names = ["localhost","site-a.localhost","app.localhost","example.com"];
+              let left = names.length;
+              for (const n of names) {
+                dns.lookup(n, { family: 4 }, (err) => {
+                  console.log(`node_lookup_${n}=` + (err ? err.code : "resolved"));
+                  if (--left === 0) process.exit(0);
+                });
+              }
+            ' 2>&1
+          else
+            echo "node_version_present=no"
+          fi
+
+      - name: Watch for drift over the life of the job
+        run: |
+          set +e
+          MINUTES="${{ inputs.watch_minutes || '12' }}"
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          TICK=0
+
+          # The verdict has to survive the VM being reaped: node-agent logs a
+          # `guest process snapshot` with every process's full exe path roughly
+          # once a minute, so a copy of /bin/sleep named after the verdict is
+          # readable from the host even when this job's stdout never reaches
+          # GitHub. Replaced each tick so the last one standing is the answer.
+          publish_verdict() {
+            rm -f /tmp/TENKI-DNSPROBE-* 2>/dev/null
+            cp /bin/sleep "/tmp/TENKI-DNSPROBE-$1" 2>/dev/null && "/tmp/TENKI-DNSPROBE-$1" 1200 &
+          }
+
+          while [ "$(date +%s)" -lt "$END" ]; do
+            TICK=$((TICK + 1))
+            SITE=$(timeout 5 getent ahostsv4 site-a.localhost >/dev/null 2>&1 && echo ok || echo FAIL)
+            PLAIN=$(timeout 5 getent ahostsv4 localhost >/dev/null 2>&1 && echo ok || echo FAIL)
+            PUBLIC=$(timeout 5 getent ahostsv4 example.com >/dev/null 2>&1 && echo ok || echo FAIL)
+            STUB=$(grep -Eq '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53([[:space:]]|$)' /etc/resolv.conf 2>/dev/null && echo stub || echo other)
+            RESOLVED=$(systemctl is-active systemd-resolved 2>/dev/null || echo unknown)
+            echo "tick=$TICK t=$(date -u +%H:%M:%S) site_a_localhost=$SITE localhost=$PLAIN example_com=$PUBLIC resolver=$STUB resolved=$RESOLVED"
+            publish_verdict "tick${TICK}-sitea-${SITE}-resolver-${STUB}-resolved-${RESOLVED}"
+            sleep 20
+          done

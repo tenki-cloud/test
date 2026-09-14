@@ -127,6 +127,28 @@ jobs:
             sleep 5
           done
           SAMPLER
+          cat > /tmp/probe/hog.py <<'HOG'
+          import sys, time
+          total = int(next(l.split()[1] for l in open('/proc/meminfo') if l.startswith('MemTotal')))
+          target = int(total * 0.92) * 1024
+          chunk, held = 64 << 20, []
+          try:
+              while sum(len(b) for b in held) < target:
+                  b = bytearray(chunk)
+                  for off in range(0, chunk, 4096):
+                      b[off] = 1
+                  held.append(b)
+          except MemoryError:
+              pass
+          print("held_mb=%d" % (sum(len(b) for b in held) >> 20), flush=True)
+          # Keep every page referenced so reclaim finds it hot and has to keep scanning.
+          while True:
+              for b in held:
+                  for off in range(0, len(b), 4096):
+                      b[off] = (b[off] + 1) & 0xFF
+              time.sleep(0.05)
+          HOG
+
           chmod +x /tmp/probe/sample.sh
           echo "sampler_installed=yes"
           echo "profile=${{ matrix.profile }}"
@@ -186,36 +208,16 @@ jobs:
               # (session 01a092e9): MemAvailable 220MB of 17GB, allocstall 81554,
               # pgscan_direct 21.2M. Its VM was thrashing, not merely full.
               #
-              # Two earlier attempts failed to get anywhere near it. Filling page
-              # cache costs the kernel nothing (it is reclaimable, allocstall
-              # stayed 0), and /dev/shm defaults to half of RAM so a dd sized
-              # above that just hits ENOSPC. What is needed is anonymous memory
-              # that stays referenced, so every reclaim scan finds it hot and has
-              # to keep scanning.
-              python3 - <<'HOG' &
-              import os, time
-              total = int(next(l.split()[1] for l in open('/proc/meminfo') if l.startswith('MemTotal')))
-              # Leave a little headroom so the OOM killer stays out of it for a
-              # while: the goal is sustained reclaim, not a kill.
-              target = int(total * 0.92) * 1024
-              chunk, held = 64 << 20, []
-              try:
-                  while sum(len(b) for b in held) < target:
-                      b = bytearray(chunk)
-                      for off in range(0, chunk, 4096):
-                          b[off] = 1
-                      held.append(b)
-              except MemoryError:
-                  pass
-              # Keep every page referenced so it cannot be cheaply evicted.
-              while True:
-                  for b in held:
-                      for off in range(0, len(b), 4096):
-                          b[off] = (b[off] + 1) & 0xFF
-                  time.sleep(0.1)
-              HOG
+              # Two earlier attempts never got near it. Page cache is reclaimable
+              # and cost the kernel nothing (allocstall stayed 0), and /dev/shm
+              # defaults to half of RAM so a dd sized above that just hits ENOSPC.
+              # This holds anonymous memory and keeps re-touching it instead.
+              python3 /tmp/probe/hog.py &
               HOG_PID=$!
-              while [ "$(date +%s)" -lt "$END" ]; do sleep 5; done
+              while [ "$(date +%s)" -lt "$END" ]; do
+                kill -0 "$HOG_PID" 2>/dev/null || echo "hog_died=yes t=$(date -u +%H:%M:%S)"
+                sleep 5
+              done
               kill -9 "$HOG_PID" 2>/dev/null
               ;;
 

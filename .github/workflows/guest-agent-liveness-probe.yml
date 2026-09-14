@@ -182,15 +182,41 @@ jobs:
               ;;
 
             memreclaim)
-              # Anonymous, resident memory - page cache is reclaimable and cost
-              # the kernel nothing last round (allocstall stayed 0). Held just
-              # under MemTotal so the kernel is forced to scan rather than OOM.
-              MEMKB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
-              HOLD=$(( MEMKB * 85 / 100 / 1024 ))
-              mkdir -p /dev/shm/probe
-              ( dd if=/dev/zero of=/dev/shm/probe/anon bs=1M count="$HOLD" 2>/dev/null; sleep 100000 ) &
+              # Target state, taken from the second of the customer's two reaps
+              # (session 01a092e9): MemAvailable 220MB of 17GB, allocstall 81554,
+              # pgscan_direct 21.2M. Its VM was thrashing, not merely full.
+              #
+              # Two earlier attempts failed to get anywhere near it. Filling page
+              # cache costs the kernel nothing (it is reclaimable, allocstall
+              # stayed 0), and /dev/shm defaults to half of RAM so a dd sized
+              # above that just hits ENOSPC. What is needed is anonymous memory
+              # that stays referenced, so every reclaim scan finds it hot and has
+              # to keep scanning.
+              python3 - <<'HOG' &
+              import os, time
+              total = int(next(l.split()[1] for l in open('/proc/meminfo') if l.startswith('MemTotal')))
+              # Leave a little headroom so the OOM killer stays out of it for a
+              # while: the goal is sustained reclaim, not a kill.
+              target = int(total * 0.92) * 1024
+              chunk, held = 64 << 20, []
+              try:
+                  while sum(len(b) for b in held) < target:
+                      b = bytearray(chunk)
+                      for off in range(0, chunk, 4096):
+                          b[off] = 1
+                      held.append(b)
+              except MemoryError:
+                  pass
+              # Keep every page referenced so it cannot be cheaply evicted.
+              while True:
+                  for b in held:
+                      for off in range(0, len(b), 4096):
+                          b[off] = (b[off] + 1) & 0xFF
+                  time.sleep(0.1)
+              HOG
+              HOG_PID=$!
               while [ "$(date +%s)" -lt "$END" ]; do sleep 5; done
-              rm -rf /dev/shm/probe
+              kill -9 "$HOG_PID" 2>/dev/null
               ;;
 
             jobshaped)

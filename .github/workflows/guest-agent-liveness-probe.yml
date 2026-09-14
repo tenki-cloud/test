@@ -54,7 +54,7 @@ jobs:
         # shape (b) is the platform's alone and no workload triggers it. The first
         # round cleared all four profiles, but none of them saturated the CPU and
         # the memory one never forced reclaim, so none tested the mechanism.
-        profile: [idle, cpusat, memreclaim, jobshaped]
+        profile: [idle, iostall, memreclaim, jobshaped]
     steps:
       - name: Install the sampler
         run: |
@@ -70,9 +70,12 @@ jobs:
           # The guest-agent is the process whose liveness node-agent is judging.
           agent_pid() {
             for p in /proc/[0-9]*; do
-              exe=$(readlink "$p/exe" 2>/dev/null) || continue
-              case "$exe" in
-                /usr/local/bin/sandbox|*guest-agent*|*guestagent*|*tenki-guest*|*vm-agent*)
+              # comm is world-readable; exe is not, for a root-owned process.
+              c=$(cat "$p/comm" 2>/dev/null) || continue
+              case "$c" in
+                sandbox|guest-agent|vm-agent)
+                  # Confirm it is the guest-agent and not a same-named child.
+                  [ "$(cut -d' ' -f4 "$p/stat" 2>/dev/null)" = "1" ] || continue
                   basename "$p"; return ;;
               esac
             done
@@ -88,12 +91,15 @@ jobs:
               AST=$(awk '/^State:/{print $2}' "/proc/$AP/status" 2>/dev/null)
               ATH=$(awk '/^Threads:/{print $2}' "/proc/$AP/status" 2>/dev/null)
               ARSS=$(awk '/^VmRSS:/{print $2}' "/proc/$AP/status" 2>/dev/null)
-              AFD=$(ls "/proc/$AP/fd" 2>/dev/null | wc -l)
+              AFD=$(sudo ls "/proc/$AP/fd" 2>/dev/null | wc -l)
+              # D means blocked in the kernel - the state a stalled rootfs
+              # produces, and the one a 3s liveness deadline cannot survive.
+              AWC=$(sudo cat "/proc/$AP/wchan" 2>/dev/null | tr -d '\0' | cut -c1-24)
             else
-              AST=gone; ATH=na; ARSS=na; AFD=na
+              AST=gone; ATH=na; ARSS=na; AFD=na; AWC=na
             fi
-            printf 'tick=%s t=%s agent_pid=%s agent_state=%s agent_threads=%s agent_rss_kb=%s agent_fds=%s procs=%s loadavg=%s memfree_kb=%s memavail_kb=%s allocstall_normal=%s pgscan_kswapd=%s pgscan_direct=%s\n' \
-              "$TICK" "$(date -u +%H:%M:%S)" "${AP:-none}" "$AST" "$ATH" "$ARSS" "$AFD" \
+            printf 'tick=%s t=%s agent_pid=%s agent_state=%s agent_threads=%s agent_rss_kb=%s agent_fds=%s agent_wchan=%s procs=%s loadavg=%s memfree_kb=%s memavail_kb=%s allocstall_normal=%s pgscan_kswapd=%s pgscan_direct=%s\n' \
+              "$TICK" "$(date -u +%H:%M:%S)" "${AP:-none}" "$AST" "$ATH" "$ARSS" "$AFD" "${AWC:-na}" \
               "$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)" \
               "$(cut -d' ' -f1-3 /proc/loadavg)" \
               "$(mem_val MemFree)" "$(mem_val MemAvailable)" \
@@ -129,18 +135,35 @@ jobs:
               while [ "$(date +%s)" -lt "$END" ]; do sleep 10; done
               ;;
 
-            cpusat)
-              # Saturate every core twice over. This is the condition the
-              # guest-agent's cpu.weight was meant to survive and, because the
-              # runner unit is outside its cgroup, the one it has no protection
-              # against.
+            iostall)
+              # CPU saturation was tested and cleared: loadavg 18.2 on 8 vCPU for
+              # 18 minutes produced zero liveness failures. The customer's guest
+              # was I/O-heavy instead - its process table is full of
+              # kworker/u128:*-iou_exit and jbd2/vda-8 - and the failure stage is
+              # response_read, which is what a guest blocked in D state on its
+              # RBD-backed rootfs would produce. So: saturate the disk, synchronously.
               N=$(( $(nproc) * 2 ))
               i=0
               while [ "$i" -lt "$N" ]; do
-                ( while :; do :; done ) & i=$((i + 1))
+                (
+                  while [ "$(date +%s)" -lt "$END" ]; do
+                    dd if=/dev/zero of="/tmp/probe/io.$$" bs=1M count=512 oflag=direct,sync 2>/dev/null
+                    dd if="/tmp/probe/io.$$" of=/dev/null bs=4k iflag=direct 2>/dev/null
+                    rm -f "/tmp/probe/io.$$"
+                  done
+                ) & i=$((i + 1))
               done
-              while [ "$(date +%s)" -lt "$END" ]; do sleep 5; done
-              kill %1 2>/dev/null; pkill -P $$ 2>/dev/null
+              # fsync storms on the journal too, which is what jbd2/vda-8 shows.
+              (
+                while [ "$(date +%s)" -lt "$END" ]; do
+                  i=0
+                  while [ "$i" -lt 2000 ]; do
+                    echo x > "/tmp/probe/j$i"; sync "/tmp/probe/j$i" 2>/dev/null; i=$((i + 1))
+                  done
+                  rm -f /tmp/probe/j*
+                done
+              ) &
+              wait
               ;;
 
             memreclaim)

@@ -46,7 +46,7 @@ on:
       profiles:
         description: 'JSON array of profiles to run, e.g. ["iostall"]'
         required: false
-        default: '["idle","memavalanche"]'
+        default: '["idle","memhover"]'
         type: string
 
 jobs:
@@ -65,7 +65,7 @@ jobs:
         # the shape is the platform's alone and no workload triggers it. CPU
         # saturation is already a settled negative (loadavg 18.2 on 8 vCPU for 18
         # minutes, zero liveness failures), so what remains to test is I/O.
-        profile: ${{ fromJSON(inputs.profiles || '["idle","memavalanche"]') }}
+        profile: ${{ fromJSON(inputs.profiles || '["idle","memhover"]') }}
     steps:
       - name: Install the sampler
         run: |
@@ -160,6 +160,42 @@ jobs:
                       b[0] = (b[0] + 1) & 0xFF
                   time.sleep(0.2)
 
+          def avail_mb():
+              for l in open('/proc/meminfo'):
+                  if l.startswith('MemAvailable'):
+                      return int(l.split()[1]) // 1024
+              return 0
+
+          if mode == 'hover':
+              # The zone the customer's guest sat in. Allocating hard trips the
+              # OOM killer, and that path already works: the guest kills the
+              # runner, node-agent logs `guest OOM kill observed` and reports
+              # `runner was killed by the OOM killer`. Their guest never got
+              # there - system_oom_kills was 0 - because the kernel could always
+              # eventually satisfy the next allocation, at the cost of scanning
+              # millions of pages. Small chunks plus a feedback loop reproduce
+              # that: grow while MemAvailable is above the floor, give a chunk
+              # back when it falls below, and keep the held set hot so reclaim
+              # has to keep working for it.
+              floor, chunk, held, n = int(sys.argv[2]), 16 << 20, [], 0
+              while True:
+                  a = avail_mb()
+                  if a > floor:
+                      try:
+                          b = bytearray(chunk)
+                          for off in range(0, chunk, 4096):
+                              b[off] = 1
+                          held.append(b)
+                      except MemoryError:
+                          pass
+                  elif a < floor // 2 and held:
+                      held.pop()
+                  for b in held[::4]:
+                      b[0] = (b[0] + 1) & 0xFF
+                  n += 1
+                  if n % 100 == 0:
+                      print("hover_%s n=%d held_mb=%d avail_mb=%d" % (sys.argv[3], n, (len(held) * chunk) >> 20, a), flush=True)
+
           if mode == 'spike':
               size, n = int(sys.argv[2]) << 20, 0
               while True:
@@ -229,18 +265,13 @@ jobs:
               rm -f /tmp/probe/io.* /tmp/probe/j* 2>/dev/null
               ;;
 
-            memavalanche)
-              # The customer's shape: a baseline near the ceiling, then several
-              # processes allocating hard *at the same time*. One allocator never
-              # produced direct reclaim in six rounds; concurrency is the variable
-              # that was missing.
+            memhover)
+              # Sit in the livelock zone instead of crashing through it.
               echo "swap_total_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
-              python3 /tmp/probe/hog.py hold 0.55 &
-              sleep 45
               N=$(nproc)
               i=1
               while [ "$i" -le "$N" ]; do
-                python3 /tmp/probe/hog.py spike 1024 "$i" &
+                python3 /tmp/probe/hog.py hover 500 "$i" &
                 i=$((i + 1))
               done
               while [ "$(date +%s)" -lt "$END" ]; do sleep 5; done

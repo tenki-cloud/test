@@ -168,33 +168,48 @@ jobs:
 
           if mode == 'hover':
               # The zone the customer's guest sat in. Allocating hard trips the
-              # OOM killer, and that path already works: the guest kills the
-              # runner, node-agent logs `guest OOM kill observed` and reports
-              # `runner was killed by the OOM killer`. Their guest never got
-              # there - system_oom_kills was 0 - because the kernel could always
-              # eventually satisfy the next allocation, at the cost of scanning
-              # millions of pages. Small chunks plus a feedback loop reproduce
-              # that: grow while MemAvailable is above the floor, give a chunk
-              # back when it falls below, and keep the held set hot so reclaim
-              # has to keep working for it.
+              # OOM killer, and that path already works: node-agent logs
+              # `guest OOM kill observed` and reports `runner was killed by the
+              # OOM killer`. Their guest never got there - system_oom_kills was 0
+              # - because every allocation could eventually be satisfied, at the
+              # cost of scanning millions of pages.
+              #
+              # Reaching the right water level is not enough: the previous round
+              # parked MemAvailable at 394MB and then idled, because touching
+              # resident pages needs no reclaim at all. Once at the floor this
+              # churns a chunk per iteration - allocate one, drop one - so the
+              # level holds while the allocator keeps demanding pages that are
+              # not on the free list.
+              #
+              # It also prints the reclaim counters itself. The shell sampler
+              # forks awk/sudo/cp every tick and does not survive down here; it
+              # died after one tick last round, which is why allocstall was never
+              # measured.
               floor, chunk, held, n = int(sys.argv[2]), 16 << 20, [], 0
+              def vm(k):
+                  for l in open('/proc/vmstat'):
+                      if l.startswith(k + ' '):
+                          return int(l.split()[1])
+                  return -1
               while True:
                   a = avail_mb()
-                  if a > floor:
-                      try:
-                          b = bytearray(chunk)
-                          for off in range(0, chunk, 4096):
-                              b[off] = 1
-                          held.append(b)
-                      except MemoryError:
-                          pass
-                  elif a < floor // 2 and held:
-                      held.pop()
+                  try:
+                      b = bytearray(chunk)
+                      for off in range(0, chunk, 4096):
+                          b[off] = 1
+                      held.append(b)
+                      if a <= floor and len(held) > 1:
+                          held.pop(0)          # churn: level holds, demand does not stop
+                  except MemoryError:
+                      if held:
+                          held.pop(0)
                   for b in held[::4]:
                       b[0] = (b[0] + 1) & 0xFF
                   n += 1
-                  if n % 100 == 0:
-                      print("hover_%s n=%d held_mb=%d avail_mb=%d" % (sys.argv[3], n, (len(held) * chunk) >> 20, a), flush=True)
+                  if n % 50 == 0:
+                      print("hover_%s n=%d held_mb=%d avail_mb=%d allocstall=%d pgscan_direct=%d pgscan_kswapd=%d"
+                            % (sys.argv[3], n, (len(held) * chunk) >> 20, a,
+                               vm('allocstall_normal'), vm('pgscan_direct'), vm('pgscan_kswapd')), flush=True)
 
           if mode == 'spike':
               size, n = int(sys.argv[2]) << 20, 0

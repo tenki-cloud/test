@@ -46,7 +46,7 @@ on:
       profiles:
         description: 'JSON array of profiles to run, e.g. ["iostall"]'
         required: false
-        default: '["idle","memhover"]'
+        default: '["idle","memthrash"]'
         type: string
 
 jobs:
@@ -65,7 +65,7 @@ jobs:
         # the shape is the platform's alone and no workload triggers it. CPU
         # saturation is already a settled negative (loadavg 18.2 on 8 vCPU for 18
         # minutes, zero liveness failures), so what remains to test is I/O.
-        profile: ${{ fromJSON(inputs.profiles || '["idle","memhover"]') }}
+        profile: ${{ fromJSON(inputs.profiles || '["idle","memthrash"]') }}
     steps:
       - name: Install the sampler
         run: |
@@ -280,17 +280,53 @@ jobs:
               rm -f /tmp/probe/io.* /tmp/probe/j* 2>/dev/null
               ;;
 
-            memhover)
-              # Sit in the livelock zone instead of crashing through it.
+            memthrash)
+              # Anonymous pressure alone cannot do it. With swap off, anonymous
+              # pages are unreclaimable: the previous round pinned MemAvailable
+              # at 250MB for 15 minutes and the kernel had nothing left to scan -
+              # allocstall stopped at 8, pgscan_direct at 55808. The customer had
+              # allocstall 81554 and pgscan_direct 21.2M because their guest also
+              # held a large *active file* working set (postgres data files,
+              # node_modules, docker layers, a fresh database per test case).
+              # Those pages are reclaimable, so the kernel evicts them, the
+              # workload immediately faults them back in, and every re-read is a
+              # blocking major fault. That is what stalls a process - including
+              # the guest-agent, whose own text pages get evicted too.
+              #
+              # So: anonymous baseline that leaves only a small page cache, plus
+              # a file working set several times larger than that cache, read in
+              # a loop through the cache (buffered, never O_DIRECT).
               echo "swap_total_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
-              N=$(nproc)
+              mkdir -p /tmp/probe/ws
               i=1
-              while [ "$i" -le "$N" ]; do
-                python3 /tmp/probe/hog.py hover 500 "$i" &
+              while [ "$i" -le 6 ]; do
+                dd if=/dev/zero of="/tmp/probe/ws/f$i" bs=1M count=1024 2>/dev/null
                 i=$((i + 1))
               done
+              sync
+              echo "workset_mb=$(du -sm /tmp/probe/ws | cut -f1)"
+
+              N=$(nproc)
+              H=$(( N / 2 ))
+              i=1
+              while [ "$i" -le "$H" ]; do
+                python3 /tmp/probe/hog.py hover 2500 "$i" &
+                i=$((i + 1))
+              done
+              sleep 60
+
+              i=1
+              while [ "$i" -le "$N" ]; do
+                (
+                  f="/tmp/probe/ws/f$(( (i % 6) + 1 ))"
+                  while [ "$(date +%s)" -lt "$END" ]; do cat "$f" > /dev/null 2>&1; done
+                ) & i=$((i + 1))
+              done
+
               while [ "$(date +%s)" -lt "$END" ]; do sleep 5; done
               pkill -f /tmp/probe/hog.py 2>/dev/null
+              pkill -P $$ 2>/dev/null
+              rm -rf /tmp/probe/ws
               ;;
 
             jobshaped)

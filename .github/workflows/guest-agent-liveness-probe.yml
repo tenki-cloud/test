@@ -212,18 +212,18 @@ jobs:
                                vm('allocstall_normal'), vm('pgscan_direct'), vm('pgscan_kswapd')), flush=True)
 
           if mode == 'storm':
-              # Rate, not level, is the variable. The real failure went from
-              # allocstall 7,637 to 167,199 in 21.5s - about 7,400 stalls/s, with
-              # pgscan_direct climbing 2.96M pages/s. Eleven earlier rounds held a
-              # low MemAvailable for fifteen minutes and reached 17 stalls/s.
+              # Rate, not level. The real failure went from allocstall 7,637 to
+              # 167,199 in 21.5s (~7,400/s) with pgscan_direct climbing 2.96M
+              # pages/s, and sat at the wall for minutes before anything died.
               #
-              # allocstall counts allocation *events* that had to reclaim in
-              # context. A 16MB bytearray is one event; what the customer had was
-              # dozens of processes each growing a heap in small steps - jest
-              # workers, a postgres backend per connection, a createdb per test.
-              # So: many processes, small chunks, grow rather than churn, and let
-              # it run up to the wall. Both real outcomes (reaper and OOM kill)
-              # live at that wall; which one fires is a race.
+              # Round 12 used 32 processes and 64KB chunks but no cap, and blew
+              # straight through: with 12GB free an allocation never stalls, so
+              # allocstall was still 49 when free memory ran out, and the OOM
+              # killer fired seconds later. Stalls only happen *at* the wall, so
+              # the run has to park there - grow to a per-process cap, then churn
+              # one chunk in, one chunk out. The level holds while the allocation
+              # *event* rate stays at 64KB granularity across every process.
+              cap = (int(sys.argv[3]) << 20) // 1        # bytes this process may hold
               chunk, held, n = 64 << 10, [], 0
               t0, last = time.time(), 0
               def vm(k):
@@ -237,10 +237,13 @@ jobs:
                       for off in range(0, chunk, 4096):
                           b[off] = 1
                       held.append(b)
+                      if len(held) * chunk > cap:
+                          held.pop(0)
                   except MemoryError:
-                      del held[:len(held) // 4]
+                      if held:
+                          del held[:max(1, len(held) // 8)]
                   n += 1
-                  if n % 2000 == 0 and sys.argv[2] == '1':
+                  if n % 5000 == 0 and sys.argv[2] == '1':
                       a, dt = vm('allocstall_normal'), time.time() - t0
                       print("storm n=%d held_mb=%d avail_mb=%d allocstall=%d rate=%.0f/s pgscan_direct=%d"
                             % (n, (len(held) * chunk) >> 20, avail_mb(), a,
@@ -317,8 +320,6 @@ jobs:
               ;;
 
             memstorm)
-              # File working set first: reclaim needs something reclaimable to
-              # scan, and with swap off only file pages qualify.
               echo "swap_total_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
               mkdir -p /tmp/probe/ws
               i=1
@@ -328,11 +329,16 @@ jobs:
               done
               sync
 
+              # Total anonymous cap ~= 78% of RAM, split across the processes, so
+              # the set parks just short of the wall and the file readers below
+              # squeeze what is left. Round 12 had no cap and blew through in 20s.
               N=$(( $(nproc) * 4 ))
-              echo "storm_procs=$N chunk_kb=64"
+              MEMMB=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 ))
+              CAP=$(( MEMMB * 78 / 100 / N ))
+              echo "storm_procs=$N chunk_kb=64 cap_mb_each=$CAP total_cap_mb=$(( CAP * N ))"
               i=1
               while [ "$i" -le "$N" ]; do
-                python3 /tmp/probe/hog.py storm "$i" &
+                python3 /tmp/probe/hog.py storm "$i" "$CAP" &
                 i=$((i + 1))
               done
 

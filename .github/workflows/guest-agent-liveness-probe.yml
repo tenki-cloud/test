@@ -351,11 +351,26 @@ jobs:
                 i=$((i + 1))
               done
 
+              # Dirty the working set, do not just read it. Round 14 matched the
+              # customer's position exactly (MemAvailable 213-288MB vs their
+              # 190-230MB) and scanned 8x as many pages in direct reclaim, yet
+              # allocstall peaked at 378/s against their ~7,400/s: 99.8% of the
+              # probe's 230k allocations/s were served without stalling at all.
+              #
+              # The reason is what kind of pages were there to reclaim. `cat`
+              # produces clean page cache, which reclaim frees for free - kswapd
+              # keeps up no matter how hard it has to scan. The customer had
+              # Postgres writing, a fresh database per test case, docker layers
+              # and MinIO: dirty pages, which cannot be freed until writeback
+              # completes. That is what puts an allocator into direct reclaim and
+              # holds it there. Buffered rewrites in a loop, never synced.
               i=1
               while [ "$i" -le "$(nproc)" ]; do
                 (
                   f="/tmp/probe/ws/f$(( (i % 6) + 1 ))"
-                  while [ "$(date +%s)" -lt "$END" ]; do cat "$f" > /dev/null 2>&1; done
+                  while [ "$(date +%s)" -lt "$END" ]; do
+                    dd if=/dev/zero of="$f" bs=1M count=512 conv=notrunc 2>/dev/null
+                  done
                 ) & i=$((i + 1))
               done
 

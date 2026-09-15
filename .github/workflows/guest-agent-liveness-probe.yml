@@ -46,7 +46,7 @@ on:
       profiles:
         description: 'JSON array of profiles to run, e.g. ["iostall"]'
         required: false
-        default: '["idle","memthrash"]'
+        default: '["idle","memstorm"]'
         type: string
 
 jobs:
@@ -65,7 +65,7 @@ jobs:
         # the shape is the platform's alone and no workload triggers it. CPU
         # saturation is already a settled negative (loadavg 18.2 on 8 vCPU for 18
         # minutes, zero liveness failures), so what remains to test is I/O.
-        profile: ${{ fromJSON(inputs.profiles || '["idle","memthrash"]') }}
+        profile: ${{ fromJSON(inputs.profiles || '["idle","memstorm"]') }}
     steps:
       - name: Install the sampler
         run: |
@@ -211,6 +211,42 @@ jobs:
                             % (sys.argv[3], n, (len(held) * chunk) >> 20, a,
                                vm('allocstall_normal'), vm('pgscan_direct'), vm('pgscan_kswapd')), flush=True)
 
+          if mode == 'storm':
+              # Rate, not level, is the variable. The real failure went from
+              # allocstall 7,637 to 167,199 in 21.5s - about 7,400 stalls/s, with
+              # pgscan_direct climbing 2.96M pages/s. Eleven earlier rounds held a
+              # low MemAvailable for fifteen minutes and reached 17 stalls/s.
+              #
+              # allocstall counts allocation *events* that had to reclaim in
+              # context. A 16MB bytearray is one event; what the customer had was
+              # dozens of processes each growing a heap in small steps - jest
+              # workers, a postgres backend per connection, a createdb per test.
+              # So: many processes, small chunks, grow rather than churn, and let
+              # it run up to the wall. Both real outcomes (reaper and OOM kill)
+              # live at that wall; which one fires is a race.
+              chunk, held, n = 64 << 10, [], 0
+              t0, last = time.time(), 0
+              def vm(k):
+                  for l in open('/proc/vmstat'):
+                      if l.startswith(k + ' '):
+                          return int(l.split()[1])
+                  return -1
+              while True:
+                  try:
+                      b = bytearray(chunk)
+                      for off in range(0, chunk, 4096):
+                          b[off] = 1
+                      held.append(b)
+                  except MemoryError:
+                      del held[:len(held) // 4]
+                  n += 1
+                  if n % 2000 == 0 and sys.argv[2] == '1':
+                      a, dt = vm('allocstall_normal'), time.time() - t0
+                      print("storm n=%d held_mb=%d avail_mb=%d allocstall=%d rate=%.0f/s pgscan_direct=%d"
+                            % (n, (len(held) * chunk) >> 20, avail_mb(), a,
+                               (a - last) / max(dt, 0.001), vm('pgscan_direct')), flush=True)
+                      t0, last = time.time(), a
+
           if mode == 'spike':
               size, n = int(sys.argv[2]) << 20, 0
               while True:
@@ -280,30 +316,9 @@ jobs:
               rm -f /tmp/probe/io.* /tmp/probe/j* 2>/dev/null
               ;;
 
-            memthrash)
-              # Anonymous pressure alone cannot do it. With swap off, anonymous
-              # pages are unreclaimable: the previous round pinned MemAvailable
-              # at 250MB for 15 minutes and the kernel had nothing left to scan -
-              # allocstall stopped at 8, pgscan_direct at 55808. The customer had
-              # allocstall 81554 and pgscan_direct 21.2M because their guest also
-              # held a large *active file* working set (postgres data files,
-              # node_modules, docker layers, a fresh database per test case).
-              # Those pages are reclaimable, so the kernel evicts them, the
-              # workload immediately faults them back in, and every re-read is a
-              # blocking major fault. That is what stalls a process - including
-              # the guest-agent, whose own text pages get evicted too.
-              #
-              # So: anonymous baseline that leaves only a small page cache, plus
-              # a file working set several times larger than that cache, read in
-              # a loop through the cache (buffered, never O_DIRECT).
-              #
-              # The floor is 400MB, not 2500. At 2500 this profile already beat
-              # the customer's reclaim rates - pgscan_direct 32.8M against their
-              # 21.2M, kswapd 417M against their 17.8M - and the guest-agent
-              # still answered every probe, with its own RSS halved. What that
-              # round did not reproduce is how tight the pool was: they sat at
-              # 220MB available while scanning that hard. Every round so far has
-              # had one or the other, never both.
+            memstorm)
+              # File working set first: reclaim needs something reclaimable to
+              # scan, and with swap off only file pages qualify.
               echo "swap_total_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
               mkdir -p /tmp/probe/ws
               i=1
@@ -312,19 +327,17 @@ jobs:
                 i=$((i + 1))
               done
               sync
-              echo "workset_mb=$(du -sm /tmp/probe/ws | cut -f1)"
 
-              N=$(nproc)
-              H=$(( N / 2 ))
-              i=1
-              while [ "$i" -le "$H" ]; do
-                python3 /tmp/probe/hog.py hover 400 "$i" &
-                i=$((i + 1))
-              done
-              sleep 60
-
+              N=$(( $(nproc) * 4 ))
+              echo "storm_procs=$N chunk_kb=64"
               i=1
               while [ "$i" -le "$N" ]; do
+                python3 /tmp/probe/hog.py storm "$i" &
+                i=$((i + 1))
+              done
+
+              i=1
+              while [ "$i" -le "$(nproc)" ]; do
                 (
                   f="/tmp/probe/ws/f$(( (i % 6) + 1 ))"
                   while [ "$(date +%s)" -lt "$END" ]; do cat "$f" > /dev/null 2>&1; done

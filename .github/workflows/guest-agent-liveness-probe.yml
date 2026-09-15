@@ -212,43 +212,52 @@ jobs:
                                vm('allocstall_normal'), vm('pgscan_direct'), vm('pgscan_kswapd')), flush=True)
 
           if mode == 'storm':
-              # Rate, not level. The real failure went from allocstall 7,637 to
-              # 167,199 in 21.5s (~7,400/s) with pgscan_direct climbing 2.96M
-              # pages/s, and sat at the wall for minutes before anything died.
+              # Two knobs, and both have to be right at once.
               #
-              # Round 12 used 32 processes and 64KB chunks but no cap, and blew
-              # straight through: with 12GB free an allocation never stalls, so
-              # allocstall was still 49 when free memory ran out, and the OOM
-              # killer fired seconds later. Stalls only happen *at* the wall, so
-              # the run has to park there - grow to a per-process cap, then churn
-              # one chunk in, one chunk out. The level holds while the allocation
-              # *event* rate stays at 64KB granularity across every process.
-              cap = (int(sys.argv[3]) << 20) // 1        # bytes this process may hold
-              chunk, held, n = 64 << 10, [], 0
-              t0, last = time.time(), 0
+              # Rate: the real guest went from allocstall 7,637 to 167,199 in
+              # 21.5s (~7,400/s). allocstall counts allocation *events* that had
+              # to reclaim in the caller's own context, so the chunk has to stay
+              # small (64KB) across many processes - round 12's 16MB chunks gave
+              # 32/s.
+              #
+              # Position: stalls only happen when the free list is empty AND
+              # kswapd cannot keep ahead. Round 12 had no cap and blew through in
+              # 20s (allocstall 49, then OOM). Round 13 capped at 78% of RAM and
+              # parked at MemAvailable 2.5GB, where kswapd kept up forever
+              # (allocstall 587 in 12 minutes, pgscan_kswapd 267M but
+              # pgscan_direct only 5M). The customer sat at 190-230MB.
+              #
+              # So: feedback on MemAvailable rather than a fixed cap, and always
+              # allocate once per iteration - round 9 stopped allocating inside
+              # its dead band, which took the event rate to zero.
+              target, chunk, held, n = int(sys.argv[3]), 64 << 10, [], 0
+              t0, last, a = time.time(), 0, 1 << 30
               def vm(k):
                   for l in open('/proc/vmstat'):
                       if l.startswith(k + ' '):
                           return int(l.split()[1])
                   return -1
               while True:
+                  if n % 16 == 0:
+                      a = avail_mb()
                   try:
                       b = bytearray(chunk)
                       for off in range(0, chunk, 4096):
                           b[off] = 1
                       held.append(b)
-                      if len(held) * chunk > cap:
-                          held.pop(0)
                   except MemoryError:
-                      if held:
-                          del held[:max(1, len(held) // 8)]
+                      del held[:max(1, len(held) // 8)]
+                  if a < target // 2:
+                      del held[:min(4, len(held))]
+                  elif a < target and held:
+                      held.pop(0)
                   n += 1
                   if n % 5000 == 0 and sys.argv[2] == '1':
-                      a, dt = vm('allocstall_normal'), time.time() - t0
-                      print("storm n=%d held_mb=%d avail_mb=%d allocstall=%d rate=%.0f/s pgscan_direct=%d"
-                            % (n, (len(held) * chunk) >> 20, avail_mb(), a,
-                               (a - last) / max(dt, 0.001), vm('pgscan_direct')), flush=True)
-                      t0, last = time.time(), a
+                      st, dt = vm('allocstall_normal'), time.time() - t0
+                      print("storm n=%d held_mb=%d avail_mb=%d allocstall=%d rate=%.0f/s pgscan_direct=%d pgscan_kswapd=%d"
+                            % (n, (len(held) * chunk) >> 20, a, st,
+                               (st - last) / max(dt, 0.001), vm('pgscan_direct'), vm('pgscan_kswapd')), flush=True)
+                      t0, last = time.time(), st
 
           if mode == 'spike':
               size, n = int(sys.argv[2]) << 20, 0
@@ -334,11 +343,11 @@ jobs:
               # squeeze what is left. Round 12 had no cap and blew through in 20s.
               N=$(( $(nproc) * 4 ))
               MEMMB=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 ))
-              CAP=$(( MEMMB * 78 / 100 / N ))
-              echo "storm_procs=$N chunk_kb=64 cap_mb_each=$CAP total_cap_mb=$(( CAP * N ))"
+              TARGET=300
+              echo "storm_procs=$N chunk_kb=64 target_memavailable_mb=$TARGET mem_total_mb=$MEMMB"
               i=1
               while [ "$i" -le "$N" ]; do
-                python3 /tmp/probe/hog.py storm "$i" "$CAP" &
+                python3 /tmp/probe/hog.py storm "$i" "$TARGET" &
                 i=$((i + 1))
               done
 

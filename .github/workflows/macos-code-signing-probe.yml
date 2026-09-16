@@ -1,0 +1,134 @@
+name: macOS code signing probe
+
+# Validates the code-signing flow we are about to document on
+# tenki.cloud/docs/runners/secrets-and-signing, which today says nothing
+# about signing despite the URL promising it.
+#
+# No Apple credentials are involved. The job mints its own self-signed
+# code-signing identity, so every step of the documented flow is exercised
+# end to end without a real certificate ever touching this repo:
+#
+#   base64 .p12  ->  temporary keychain  ->  codesign  ->  verify  ->  discard
+#
+# The base64 hop mirrors how a customer would carry a real .p12 through
+# GitHub Actions secrets. What this does NOT prove is Apple trust: a
+# self-signed identity will not pass Gatekeeper or notarization. Those need
+# a real Developer ID, and the job only checks that the tooling is present.
+#
+# Run it:  gh workflow run macos-code-signing-probe.yml --repo tenki-cloud/test
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: macOS runner label
+        default: tenki-macos-latest-mini
+        type: string
+
+jobs:
+  sign:
+    name: ${{ inputs.label }}
+    runs-on: ${{ inputs.label }}
+    timeout-minutes: 20
+
+    env:
+      P12_PASSWORD: probe-p12-password
+      KEYCHAIN_PASSWORD: probe-keychain-password
+      KEYCHAIN: build.keychain
+      IDENTITY: Tenki Docs Signing Probe
+
+    steps:
+      - name: Runner identity
+        shell: bash
+        run: |
+          set +e
+          sw_vers
+          echo "user    : $(whoami)"
+          echo "hostname: $(hostname)"
+          echo "keychains at start:"; security list-keychains
+
+      - name: Mint a self-signed code-signing identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cat > ext.cnf <<'EOF'
+          [req]
+          distinguished_name = dn
+          [dn]
+          [codesign]
+          basicConstraints=critical,CA:FALSE
+          keyUsage=critical,digitalSignature
+          extendedKeyUsage=critical,codeSigning
+          EOF
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout key.pem -out cert.pem \
+            -subj "/CN=$IDENTITY" \
+            -config ext.cnf -extensions codesign
+          openssl pkcs12 -export -out cert.p12 \
+            -inkey key.pem -in cert.pem \
+            -passout "pass:$P12_PASSWORD"
+          # This is the hop a customer makes through GitHub Actions secrets.
+          base64 -i cert.p12 -o cert.p12.b64
+          echo "p12 base64 length: $(wc -c < cert.p12.b64)"
+
+      - name: Import into a temporary keychain
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          base64 -D -i cert.p12.b64 -o restored.p12
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+
+          security import restored.p12 -k "$KEYCHAIN" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          echo "--- identities visible to codesign ---"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Sign and verify a binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          printf 'int main(void){return 0;}\n' > probe.c
+          clang -o probe probe.c
+
+          echo "--- before signing ---"
+          codesign -dv probe 2>&1 || true
+
+          codesign --force --timestamp=none --keychain "$KEYCHAIN" \
+            --sign "$IDENTITY" probe
+
+          echo "--- after signing ---"
+          codesign -dv --verbose=4 probe 2>&1
+          echo "--- verify ---"
+          codesign --verify --strict --verbose=2 probe 2>&1
+          echo "SIGNING OK"
+
+      - name: Release toolchain availability
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "xcodebuild : $(xcodebuild -version 2>/dev/null | head -1)"
+          echo "notarytool : $(xcrun notarytool --version 2>&1 | head -1)"
+          echo "fastlane   : $(fastlane --version 2>/dev/null | grep -m1 fastlane)"
+          echo "security   : $(security help 2>&1 | head -1)"
+          echo "codesign   : $(codesign --help 2>&1 | head -1)"
+
+      - name: Discard the keychain
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          security delete-keychain "$KEYCHAIN"
+          echo "keychains after cleanup:"; security list-keychains
+          echo "The VM itself is destroyed at job end, so this step is belt and braces."

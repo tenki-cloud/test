@@ -1,0 +1,72 @@
+name: Nested virtualization (KVM) probe
+
+# Settles whether a Tenki Linux runner can run a nested VM, against
+# ubuntu-latest as the control. Code alone is inconclusive: the runner
+# node-agent only passes `nested=false` to cloud-hypervisor when a CPU
+# profile is configured, otherwise it passes nothing and CH's own default
+# applies. So we ask the guest directly.
+#
+# The decisive step is the last one: boot a real VM under QEMU with
+# -enable-kvm. Everything before it is diagnosis for when that fails.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - tenki-standard-small-2c-4g
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+
+    steps:
+      - name: CPU virtualization flags
+        shell: bash
+        run: |
+          set +e
+          echo "runner    : ${{ matrix.runner }}"
+          grep -m1 'model name' /proc/cpuinfo
+          echo "vmx/svm in cpuinfo flags:"
+          grep -oE '\b(vmx|svm)\b' /proc/cpuinfo | sort -u || echo "  (none — no virtualization extensions exposed)"
+          echo "hypervisor flag (we are a guest):"
+          grep -oE '\bhypervisor\b' /proc/cpuinfo | head -1 || echo "  (absent)"
+
+      - name: /dev/kvm
+        shell: bash
+        run: |
+          set +e
+          if [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+            echo "readable: $([ -r /dev/kvm ] && echo yes || echo no)   writable: $([ -w /dev/kvm ] && echo yes || echo no)"
+          else
+            echo "/dev/kvm ABSENT"
+          fi
+          echo "--- kvm module nested parameter ---"
+          for m in kvm_amd kvm_intel; do
+            p=/sys/module/$m/parameters/nested
+            [ -r "$p" ] && echo "$m.nested = $(cat $p)" || echo "$m: not loaded"
+          done
+          echo "--- loaded kvm modules ---"
+          lsmod | grep -i kvm || echo "  (none)"
+
+      - name: Boot a VM under KVM
+        shell: bash
+        run: |
+          set +e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 qemu-kvm >/dev/null 2>&1
+          echo "qemu: $(qemu-system-x86_64 --version 2>/dev/null | head -1)"
+          echo
+          echo "=== qemu-system-x86_64 -enable-kvm (no disk; we only care whether KVM initialises) ==="
+          timeout 60 qemu-system-x86_64 -enable-kvm -m 256 -display none -nographic -no-reboot 2>&1 | head -20
+          rc=${PIPESTATUS[0]}
+          echo "--- exit code: $rc ---"
+          echo
+          echo "VERDICT:"
+          echo "  'Could not access KVM kernel module' / 'KVM is not supported' => nested virtualization NOT available"
+          echo "  'No bootable device' or a boot attempt                        => nested virtualization IS available"

@@ -1,0 +1,88 @@
+name: Host perf probe
+
+# Same workload on every runner, to separate CPU from disk on each kind of host:
+# fio (fsync-heavy, sequential, random read), small-file churn, tsc on disk and on
+# tmpfs (one compile and one per vCPU), and pgbench with fsync on. Guest steal time
+# is recorded per phase. Tenki jobs run two at a time so the probe adds little host
+# load; the host each job landed on is resolved afterwards from sandbox_sessions.
+#
+# Every result line: HP|<runner>|<rep>|<key>|<value>
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  TS_VERSION: '5.6.3'
+
+jobs:
+  tenki:
+    name: ${{ matrix.runner }} #${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        runner: [tenki-standard-large-8c-16g]
+        rep: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    services:
+      pg_db:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      R: ${{ matrix.runner }}
+      N: ${{ matrix.rep }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Probe
+        env:
+          PG_CID: ${{ job.services.pg_db.id }}
+        run: bash scripts/host-perf.sh
+
+  blacksmith:
+    name: ${{ matrix.runner }} #${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        runner: [blacksmith-8vcpu-ubuntu-2404, blacksmith-4vcpu-ubuntu-2404]
+        rep: [1, 2, 3, 4, 5]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    services:
+      pg_db:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      R: ${{ matrix.runner }}
+      N: ${{ matrix.rep }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Probe
+        env:
+          PG_CID: ${{ job.services.pg_db.id }}
+        run: bash scripts/host-perf.sh

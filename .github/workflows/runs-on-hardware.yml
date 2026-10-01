@@ -1,0 +1,81 @@
+name: runs-on hardware suite
+
+# Runs the hardware groups of runs-on-demo/benchmark-public (the harness behind
+# runs-on.com/benchmarks) at a pinned commit, so tenki numbers line up with the
+# results it publishes for other providers. PassMark is skipped because it
+# downloads a vendor binary at run time.
+#
+# Result lines: ROINFO|<runner>|<rep>|<key>|<value> and ROJSON|<runner>|<rep>|<metrics json>
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: ${{ matrix.runner }} #${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        runner:
+          - tenki-standard-large-8c-16g
+          - blacksmith-8vcpu-ubuntu-2404
+          - blacksmith-4vcpu-ubuntu-2404
+        rep: [1, 2]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      HARNESS_SHA: 6cfccb0c112ab8f56fad12cf1d593acb3d6ccf0f
+      R: ${{ matrix.runner }}
+      N: ${{ matrix.rep }}
+      OUT: ${{ github.workspace }}/../bench-metrics.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: runs-on-demo/benchmark-public
+          ref: ${{ env.HARNESS_SHA }}
+          path: .harness
+          persist-credentials: false
+      - name: Host info
+        run: |
+          i() { echo "ROINFO|$R|$N|$1|$2"; }
+          i runner_name "$RUNNER_NAME"
+          i nproc "$(nproc)"
+          i mem_gb "$(free -g | awk '/^Mem:/{print $2}')"
+          i start_utc "$(date -u +%FT%TZ)"
+          for b in /sys/block/*; do
+            n=$(basename "$b"); case "$n" in loop*|ram*|zram*|nbd*) continue;; esac
+            i "blk_${n}_write_cache" "$(cat "$b/queue/write_cache" 2>/dev/null)"
+          done
+          i work_src "$(findmnt -no SOURCE -T "$GITHUB_WORKSPACE" 2>/dev/null)"
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sysbench fio p7zip-full postgresql-client unzip
+      - name: cpu
+        continue-on-error: true
+        run: python3 .harness/bin/hw-bench.py cpu --out "$OUT"
+      - name: memory
+        continue-on-error: true
+        run: python3 .harness/bin/hw-bench.py memory --out "$OUT"
+      - name: disk
+        continue-on-error: true
+        run: python3 .harness/bin/hw-bench.py disk --out "$OUT"
+      - name: network
+        continue-on-error: true
+        run: python3 .harness/bin/hw-bench.py network --out "$OUT"
+      - name: docker
+        continue-on-error: true
+        run: python3 .harness/bin/hw-bench.py docker --out "$OUT"
+      - name: postgres
+        continue-on-error: true
+        run: python3 .harness/bin/hw-bench.py postgres --out "$OUT"
+      - name: Report
+        if: always()
+        run: |
+          echo "ROINFO|$R|$N|end_utc|$(date -u +%FT%TZ)"
+          python3 -c 'import json,os,sys; print("ROJSON|%s|%s|%s" % (os.environ["R"], os.environ["N"], json.dumps(json.load(open(sys.argv[1])), separators=(",",":"))))' "$OUT"

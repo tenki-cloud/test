@@ -30,6 +30,15 @@ p kernel "$(uname -r)"
 p disk_src "$(df -P "$D" | awk 'NR==2{print $1}')"
 p disk_fs "$(df -PT "$D" | awk 'NR==2{print $2}')"
 
+# Block devices as the guest sees them: write cache mode decides whether fsync sends a flush.
+for b in /sys/block/*; do
+  n=$(basename "$b"); case "$n" in loop*|ram*|zram*|nbd*) continue;; esac
+  p "blk_${n}_write_cache" "$(cat "$b/queue/write_cache" 2>/dev/null)"
+  p "blk_${n}_fua" "$(cat "$b/queue/fua" 2>/dev/null)"
+  p "blk_${n}_size_gb" "$(( $(cat "$b/size" 2>/dev/null || echo 0) * 512 / 1000000000 ))"
+done
+p root_src "$(findmnt -no SOURCE / 2>/dev/null)"
+p work_src "$(findmnt -no SOURCE -T "$D" 2>/dev/null)"
 sudo apt-get update -qq >/dev/null 2>&1
 sudo apt-get install -y -qq --no-install-recommends fio jq >/dev/null 2>&1
 p fio_version "$(fio --version 2>/dev/null)"

@@ -26,7 +26,7 @@ jobs:
       max-parallel: 2
       matrix:
         runner: [tenki-standard-large-8c-16g]
-        rep: [1, 2, 3, 4, 5, 6, 7, 8]
+        rep: [1, 2, 3, 4, 5, 6]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     services:
@@ -60,7 +60,7 @@ jobs:
       max-parallel: 6
       matrix:
         runner: [blacksmith-8vcpu-ubuntu-2404, blacksmith-4vcpu-ubuntu-2404]
-        rep: [1, 2, 3, 4, 5]
+        rep: [1, 2, 3]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     services:

@@ -1,0 +1,69 @@
+name: Blacksmith CPU probe
+
+# Blacksmith masks the CPU model name ("AMD EPYC" / "Intel(R) Xeon(R) Processor").
+# CPUID family/model/stepping and feature flags usually pass through, which is
+# enough to identify the part. The fleet mixes Intel (host gen 1) and AMD (gen 2),
+# so each tier is sampled several times. A tenki 8c row runs the same single-thread
+# benchmark for comparison.
+#
+# Every result line starts with CPUPROBE|<runner>|<rep>|<key>|<value>.
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} #${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - blacksmith-2vcpu-ubuntu-2404
+          - blacksmith-4vcpu-ubuntu-2404
+          - blacksmith-8vcpu-ubuntu-2404
+          - blacksmith-16vcpu-ubuntu-2404
+          - tenki-standard-large-8c-16g
+        rep: [1, 2, 3, 4]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      R: ${{ matrix.runner }}
+      N: ${{ matrix.rep }}
+
+    steps:
+      - name: CPU identity
+        run: |
+          set +e
+          p() { echo "CPUPROBE|$R|$N|$1|$2"; }
+          c() { awk -F': ' -v k="$1" '$1 ~ "^"k"[[:space:]]*$" {print $2; exit}' /proc/cpuinfo; }
+          p runner_name "${RUNNER_NAME}"
+          p vendor "$(c vendor_id)"
+          p model_name "$(c 'model name')"
+          p family "$(c 'cpu family')"
+          p model "$(c model)"
+          p stepping "$(c stepping)"
+          p microcode "$(c microcode)"
+          p mhz "$(c 'cpu MHz')"
+          p nproc "$(nproc)"
+          p mem_gb "$(free -g | awk '/^Mem:/{print $2}')"
+          p hypervisor "$(lscpu | awk -F: '/Hypervisor vendor/{gsub(/^ +/,"",$2); print $2}')"
+          p l2 "$(lscpu | awk -F: '/^L2 cache/{gsub(/^ +/,"",$2); print $2}')"
+          p l3 "$(lscpu | awk -F: '/^L3 cache/{gsub(/^ +/,"",$2); print $2}')"
+          fl="$(c flags)"
+          for f in avx512f avx512_vp2intersect avx512_fp16 avx512_bf16 amx_tile avx_vnni vaes sha_ni; do
+            case " $fl " in *" $f "*) p "flag_$f" yes ;; *) p "flag_$f" no ;; esac
+          done
+
+      - name: Single- and multi-thread benchmark
+        run: |
+          set +e
+          sudo apt-get update -qq >/dev/null 2>&1
+          sudo apt-get install -y -qq --no-install-recommends sysbench >/dev/null 2>&1
+          st=$(sysbench cpu --threads=1 --time=10 --cpu-max-prime=20000 run | awk '/events per second/{print $4}')
+          echo "CPUPROBE|$R|$N|st_eps|$st"
+          mt=$(sysbench cpu --threads="$(nproc)" --time=10 --cpu-max-prime=20000 run | awk '/events per second/{print $4}')
+          echo "CPUPROBE|$R|$N|mt_eps|$mt"

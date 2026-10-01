@@ -1,0 +1,64 @@
+name: Clock and memory probe
+
+# Checks whether a guest reads time cheaply (TSC via vDSO) or falls back to a
+# slower clocksource, and measures memory bandwidth with large blocks so the
+# result is not dominated by per-event timer calls.
+#
+# Result lines: CK|<runner>|<rep>|<key>|<value>
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} #${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [tenki-standard-large-8c-16g, blacksmith-8vcpu-ubuntu-2404]
+        rep: [1, 2]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      R: ${{ matrix.runner }}
+      N: ${{ matrix.rep }}
+    steps:
+      - name: Probe
+        run: |
+          set +e
+          p() { echo "CK|$R|$N|$1|$2"; }
+          p runner_name "$RUNNER_NAME"
+          p clocksource "$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
+          p clocksource_available "$(cat /sys/devices/system/clocksource/clocksource0/available_clocksource)"
+          fl=$(awk -F': ' '/^flags/{print $2; exit}' /proc/cpuinfo)
+          for f in constant_tsc nonstop_tsc tsc_known_freq tsc_reliable rdtscp; do
+            case " $fl " in *" $f "*) p "flag_$f" yes ;; *) p "flag_$f" no ;; esac
+          done
+          p cpu_mhz "$(awk -F': ' '/^cpu MHz/{print $2; exit}' /proc/cpuinfo)"
+          sudo dmesg 2>/dev/null | grep -iE 'clocksource|tsc' | tail -12 | sed 's/|/\//g' | while read -r l; do p dmesg "$l"; done
+          cat > /tmp/clk.c <<'C'
+          #include <stdio.h>
+          #include <time.h>
+          #include <sys/time.h>
+          #include <unistd.h>
+          #include <sys/syscall.h>
+          static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e9+t.tv_nsec;}
+          int main(void){
+            const long n=5000000; struct timespec ts; struct timeval tv; volatile long s=0;
+            double a=now(); for(long i=0;i<n;i++){clock_gettime(CLOCK_MONOTONIC,&ts); s+=ts.tv_nsec;} double b=now();
+            printf("clock_gettime_ns %.1f\n",(b-a)/n);
+            a=now(); for(long i=0;i<n;i++){gettimeofday(&tv,0); s+=tv.tv_usec;} b=now();
+            printf("gettimeofday_ns %.1f\n",(b-a)/n);
+            a=now(); for(long i=0;i<n/5;i++){s+=syscall(SYS_getppid);} b=now();
+            printf("syscall_getppid_ns %.1f\n",(b-a)/(n/5));
+            return 0; }
+          C
+          sed -i 's/^          //' /tmp/clk.c
+          gcc -O2 -o /tmp/clk /tmp/clk.c && /tmp/clk | while read -r k v; do p "$k" "$v"; done
+          sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq sysbench >/dev/null 2>&1
+          for bs in 1K 1M; do
+            for op in read write; do
+              v=$(sysbench memory --memory-block-size=$bs --memory-total-size=400G --memory-oper=$op --threads=$(nproc) --time=10 run | awk '/MiB\/sec/{gsub(/[()]/,"",$4); print $4; exit}')
+              p "mem_${op}_${bs}_mibs" "$v"
+            done
+          done

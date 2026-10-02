@@ -1,0 +1,55 @@
+name: Host smoke
+
+# Exercises the usual runner paths on whichever host each job lands on. Every
+# job holds its VM for a while so concurrent placements spread across the
+# pinned hosts; the host is resolved afterwards from sandbox_sessions.
+#
+# Result lines: SMOKE|<rep>|<key>|<value>
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    name: smoke #${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    runs-on: tenki-standard-large-8c-16g
+    timeout-minutes: 20
+    env:
+      N: ${{ matrix.rep }}
+    steps:
+      - name: Identity
+        run: |
+          p() { echo "SMOKE|$N|$1|$2"; }
+          p runner_name "$RUNNER_NAME"
+          p nproc "$(nproc)"
+          p mem_gb "$(free -g | awk '/^Mem:/{print $2}')"
+          p clocksource "$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
+          p tsc_unstable "$(sudo dmesg 2>/dev/null | grep -c 'Marking TSC unstable')"
+          p vda_write_cache "$(cat /sys/block/vda/queue/write_cache 2>/dev/null)"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: npm install
+        run: |
+          mkdir -p /tmp/npmt && cd /tmp/npmt && npm init -y >/dev/null
+          s=$(date +%s); npm install --no-audit --no-fund typescript@5.6.3 >/dev/null
+          echo "SMOKE|$N|npm_install_s|$(( $(date +%s) - s ))"
+      - name: Docker
+        run: |
+          s=$(date +%s); docker run --rm alpine:3.20 sh -c 'echo ok' | grep -q ok
+          echo "SMOKE|$N|docker_s|$(( $(date +%s) - s ))"
+      - name: apt and network
+        run: |
+          sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq --no-install-recommends jq >/dev/null 2>&1
+          jq --version
+          curl -fsS -o /dev/null -w '%{http_code}\n' https://github.com
+      - name: Hold
+        run: |
+          sleep 90
+          echo "SMOKE|$N|done|ok"

@@ -17,12 +17,15 @@ jobs:
     name: ${{ matrix.runner }} #${{ matrix.rep }}
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 11
       matrix:
         include:
           - { runner: tenki-standard-large-8c-16g, rep: 1 }
           - { runner: tenki-standard-large-8c-16g, rep: 2 }
           - { runner: tenki-standard-large-8c-16g, rep: 3 }
+          - { runner: tenki-standard-large-8c-16g, rep: 4 }
+          - { runner: tenki-standard-large-8c-16g, rep: 5 }
+          - { runner: tenki-standard-large-8c-16g, rep: 6 }
           - { runner: blacksmith-8vcpu-ubuntu-2404, rep: 1 }
           - { runner: blacksmith-8vcpu-ubuntu-2404, rep: 2 }
           - { runner: blacksmith-8vcpu-ubuntu-2404, rep: 3 }

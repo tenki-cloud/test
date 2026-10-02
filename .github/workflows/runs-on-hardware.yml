@@ -19,13 +19,17 @@ jobs:
     name: ${{ matrix.runner }} #${{ matrix.rep }}
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 12
       matrix:
         runner:
           - tenki-standard-large-8c-16g
           - blacksmith-8vcpu-ubuntu-2404
           - blacksmith-4vcpu-ubuntu-2404
-        rep: [1, 2]
+        rep: [1, 2, 3]
+        include:
+          - { runner: tenki-standard-large-8c-16g, rep: 4 }
+          - { runner: tenki-standard-large-8c-16g, rep: 5 }
+          - { runner: tenki-standard-large-8c-16g, rep: 6 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:

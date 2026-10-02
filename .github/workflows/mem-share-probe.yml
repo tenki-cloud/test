@@ -1,0 +1,71 @@
+name: Memory sharing probe
+
+# Separates memory bandwidth from cache-coherence cost: sysbench memory write
+# with a shared (global) versus per-thread (local) buffer, an atomic counter
+# hammered by every vCPU, and two-thread cache-line ping-pong latency.
+#
+# Result lines: MS|<runner>|<rep>|<key>|<value>
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} #${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [tenki-standard-large-8c-16g, blacksmith-8vcpu-ubuntu-2404]
+        rep: [1, 2, 3]
+        include:
+          - { runner: tenki-standard-large-8c-16g, rep: 4 }
+          - { runner: tenki-standard-large-8c-16g, rep: 5 }
+          - { runner: tenki-standard-large-8c-16g, rep: 6 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      R: ${{ matrix.runner }}
+      N: ${{ matrix.rep }}
+    steps:
+      - name: Probe
+        run: |
+          set +e
+          p() { echo "MS|$R|$N|$1|$2"; }
+          p runner_name "$RUNNER_NAME"
+          p lscpu "$(lscpu | awk -F': *' '/^(Socket|Core|Thread|NUMA node\(s\)|L3)/{printf "%s=%s;", $1, $2}')"
+          sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq sysbench >/dev/null 2>&1
+          NP=$(nproc)
+          sb() { sysbench memory --memory-block-size=1M --memory-total-size=400G --memory-oper=write --memory-scope=$1 --threads=$2 --time=8 run | awk '/MiB\/sec/{gsub(/[()]/,"",$4); print $4; exit}'; }
+          p sb_write_global_np_mibs "$(sb global $NP)"
+          p sb_write_local_np_mibs "$(sb local $NP)"
+          p sb_write_1t_mibs "$(sb local 1)"
+          cat > /tmp/coh.c <<'C'
+          #define _GNU_SOURCE
+          #include <pthread.h>
+          #include <sched.h>
+          #include <stdatomic.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <time.h>
+          #include <unistd.h>
+          static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e9+t.tv_nsec;}
+          static void pin(int c){cpu_set_t s;CPU_ZERO(&s);CPU_SET(c,&s);pthread_setaffinity_np(pthread_self(),sizeof s,&s);}
+          static _Atomic long shared; static long iters;
+          struct pad { _Atomic long v; char p[120]; }; static struct pad priv[256];
+          static void *hammer(void *a){long i=(long)a; pin(i); for(long k=0;k<iters;k++) atomic_fetch_add(&shared,1); return 0;}
+          static void *own(void *a){long i=(long)a; pin(i); for(long k=0;k<iters;k++) atomic_fetch_add(&priv[i].v,1); return 0;}
+          static _Atomic long ball; static long rounds;
+          static void *pong(void *a){long c=(long)a; pin(c); for(long r=0;r<rounds;r++){ while(atomic_load(&ball)!=2*r+1); atomic_store(&ball,2*r+2);} return 0;}
+          static double pingpong(int a,int b){ pthread_t t; atomic_store(&ball,0); pthread_create(&t,0,pong,(void*)(long)b); pin(a);
+            double s=now(); for(long r=0;r<rounds;r++){ atomic_store(&ball,2*r+1); while(atomic_load(&ball)!=2*r+2);} double e=now(); pthread_join(t,0); return (e-s)/rounds/2; }
+          int main(void){ int np=sysconf(_SC_NPROCESSORS_ONLN); pthread_t t[256];
+            iters=5000000;
+            double s=now(); for(long i=0;i<np;i++) pthread_create(&t[i],0,hammer,(void*)i); for(int i=0;i<np;i++) pthread_join(t[i],0);
+            printf("atomic_shared_ns_per_op %.1f\n",(now()-s)/(iters*np));
+            s=now(); for(long i=0;i<np;i++) pthread_create(&t[i],0,own,(void*)i); for(int i=0;i<np;i++) pthread_join(t[i],0);
+            printf("atomic_private_ns_per_op %.2f\n",(now()-s)/(iters*np));
+            rounds=200000; for(int b=1;b<np;b++) printf("pingpong_0_%d_ns %.1f\n",b,pingpong(0,b));
+            return 0; }
+          C
+          sed -i 's/^          //' /tmp/coh.c
+          gcc -O2 -pthread -o /tmp/coh /tmp/coh.c && /tmp/coh | while read -r k v; do p "$k" "$v"; done
